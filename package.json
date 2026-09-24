@@ -1,0 +1,13 @@
+{
+  "name": "rao-brothers-isp",
+  "version": "1.0.0",
+  "description": "Rao Brothers ISP customer, admin and worker portal",
+  "main": "server.js",
+  "scripts": {
+    "build": "echo build",
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
