@@ -5,8 +5,13 @@
   "main": "server.js",
   "scripts": {
     "build": "echo build",
+    "dev": "node server.js",
     "start": "node server.js"
   },
-  "engines": { "node": ">=22" },
-  "dependencies": { "mysql2": "^3.14.1" }
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "mysql2": "^3.14.1"
+  }
 }
