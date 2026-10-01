@@ -26,11 +26,11 @@ async function sendPushForNotification(d,n){const to=String(n.to||'').toUpperCas
 
 function rowCustomer(r){return {id:r.id,name:r.name,mobile:r.mobile,address:r.address,pppoe:r.pppoe,oltId:r.olt_id,ponId:r.pon_id,wirelessDeviceId:r.wireless_device_id||null,plan:r.plan,price:Number(r.price||0),startDate:r.start_date?String(r.start_date).slice(0,10):null,expiry:r.expiry?String(r.expiry).slice(0,10):null,activationDate:r.activation_date?String(r.activation_date).slice(0,10):null,totalPlanMonths:r.total_plan_months==null?null:Number(r.total_plan_months),usedMonths:r.used_months==null?null:Number(r.used_months),remainingMonths:r.remaining_months==null?null:Number(r.remaining_months),status:r.status,password:r.password,passwordChangeCount:Number(r.password_change_count||0),passwordChangeAllowed:!!r.password_change_allowed,blocked:!!r.blocked,credit:Number(r.credit||0),dueBalance:Number(r.due_balance||0),dueItems:r.due_items||[],isExistingCustomer:!!r.is_existing_customer,referralCode:r.referral_code}}
 function rowComplaint(r){return {id:r.id,customerId:r.customer_id,type:r.type,message:r.message,status:r.status,priority:r.priority,workerId:r.worker_id,workerName:r.worker_name,customerLat:r.customer_lat==null?null:Number(r.customer_lat),customerLng:r.customer_lng==null?null:Number(r.customer_lng),technicianDone:!!r.technician_done,technicianDoneAt:r.technician_done_at,customerConfirmed:!!r.customer_confirmed,customerConfirmedAt:r.customer_confirmed_at,assignedAt:r.assigned_at,onTheWayAt:r.on_the_way_at,workStartedAt:r.work_started_at,expectedVisitAt:r.expected_visit_at,workNote:r.work_note,materials:r.materials,beforePhoto:r.before_photo,afterPhoto:r.after_photo,locationUpdatedAt:r.location_updated_at,resolvedAt:r.resolved_at,createdAt:r.created_at,updatedAt:r.updated_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
-function rowNotification(r){return {id:r.id,to:r.recipient_type==='CUSTOMER'?r.recipient_id:r.recipient_type==='OLT'?'OLT:'+r.recipient_id:r.recipient_type==='PON'?'PON:'+r.recipient_id:r.recipient_type,title:r.title,message:r.message,metaKey:r.meta_key,createdAt:r.created_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
+function rowNotification(r){return {id:r.id,to:r.recipient_type==='CUSTOMER'?r.recipient_id:r.recipient_type==='WORKER'?r.recipient_id:r.recipient_type==='OLT'?'OLT:'+r.recipient_id:r.recipient_type==='PON'?'PON:'+r.recipient_id:r.recipient_type,title:r.title,message:r.message,metaKey:r.meta_key,createdAt:r.created_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
 async function loadDBFromMySQL(){
  const p=getPool(), d=fresh();
  const [[workers],[olts],[pons],[wirelessDevices],[customers],[plans],[offers],[notifications],[payments],[complaints],[referrals],[upgrades],[passwordChangeRequests],[settings]] = await Promise.all([
-  p.query('SELECT * FROM workers ORDER BY created_at,id'),p.query('SELECT * FROM olts ORDER BY created_at,id'),p.query('SELECT * FROM pons ORDER BY created_at,id'),p.query('SELECT * FROM wireless_devices ORDER BY created_at,id'),p.query('SELECT * FROM customers ORDER BY created_at,id'),p.query('SELECT * FROM plans ORDER BY id'),p.query('SELECT * FROM offers ORDER BY created_at DESC'),p.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 500'),p.query('SELECT * FROM payments ORDER BY created_at DESC'),p.query('SELECT * FROM complaints ORDER BY created_at DESC'),p.query('SELECT * FROM referrals ORDER BY created_at DESC'),p.query('SELECT * FROM upgrades ORDER BY created_at DESC'),p.query('SELECT * FROM password_change_requests ORDER BY requested_at DESC'),p.query('SELECT * FROM settings')
+  p.query('SELECT * FROM workers ORDER BY created_at,id'),p.query('SELECT * FROM olts ORDER BY created_at,id'),p.query('SELECT * FROM pons ORDER BY created_at,id'),p.query('SELECT * FROM wireless_devices ORDER BY created_at,id'),p.query('SELECT * FROM customers ORDER BY created_at,id'),p.query('SELECT * FROM plans ORDER BY id'),p.query('SELECT * FROM offers ORDER BY created_at DESC'),p.query('SELECT * FROM notifications ORDER BY created_at DESC'),p.query('SELECT * FROM payments ORDER BY created_at DESC'),p.query('SELECT * FROM complaints ORDER BY created_at DESC'),p.query('SELECT * FROM referrals ORDER BY created_at DESC'),p.query('SELECT * FROM upgrades ORDER BY created_at DESC'),p.query('SELECT * FROM password_change_requests ORDER BY requested_at DESC'),p.query('SELECT * FROM settings')
  ]);
  d.workers=workers.map(r=>({id:r.id,name:r.name,mobile:r.mobile,status:r.status,lat:r.lat==null?null:Number(r.lat),lng:r.lng==null?null:Number(r.lng),lastLocation:r.last_location,password:r.password,active:!!r.active}));
  d.olts=olts; d.pons=pons.map(r=>({id:r.id,oltId:r.olt_id,name:r.name})); d.wirelessDevices=wirelessDevices.map(r=>({id:r.id,name:r.name,brand:r.brand||'',model:r.model||'',ip:r.ip||'',location:r.location||'',type:r.type||'',notes:r.notes||'',active:!!r.active})); d.customers=customers.map(rowCustomer); d.plans=plans.map(r=>({id:r.id,name:r.name,price:Number(r.price||0),active:!!r.active}));
@@ -72,6 +72,7 @@ function persistDB(d){
    for(const r of d.upgrades||[]) await c.query('INSERT INTO upgrades(id,customer_id,customer_name,current_plan,current_price,requested_plan,requested_price,status,created_at,approved_at,rejected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',[r.id,r.customerId,r.customerName||null,r.currentPlan||null,r.currentPrice??null,r.requestedPlan||null,r.requestedPrice??null,r.status||'Pending',r.createdAt?new Date(r.createdAt):new Date(),r.approvedAt?new Date(r.approvedAt):null,r.rejectedAt?new Date(r.rejectedAt):null]);
    for(const r of d.passwordChangeRequests||[]) await c.query('INSERT INTO password_change_requests(id,customer_id,customer_name,status,requested_at,approved_at,rejected_at) VALUES(?,?,?,?,?,?,?)',[r.id,r.customerId,r.customerName||null,r.status||'Pending',r.requestedAt?new Date(r.requestedAt):new Date(),r.approvedAt?new Date(r.approvedAt):null,r.rejectedAt?new Date(r.rejectedAt):null]);
    await c.commit();
+   await saveDailyBackup(d);
   }catch(e){await c.rollback();console.error('MySQL persist error:',e.message);throw e}finally{c.release()}
  }).catch(e=>console.error('MySQL queue error:',e.message));
  return persistQueue;
@@ -82,10 +83,35 @@ async function ensureWirelessSchema(){
  const [[col]] = await p.query(`SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='customers' AND COLUMN_NAME='wireless_device_id'`);
  if(!Number(col.n)) await p.query(`ALTER TABLE customers ADD COLUMN wireless_device_id VARCHAR(32) NULL AFTER pon_id`);
 }
+let lastBackupDate='';
+async function ensureBackupSchema(){
+ const p=getPool();
+ await p.query(`CREATE TABLE IF NOT EXISTS rao_daily_backups (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,backup_date DATE NOT NULL UNIQUE,payload LONGTEXT NOT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+async function saveDailyBackup(d){
+ try{
+  const today=iso(new Date());
+  if(lastBackupDate===today) return;
+  const p=getPool();
+  const payload={version:1,backupDate:today,createdAt:new Date().toISOString(),customers:d.customers||[],workers:d.workers||[],olts:d.olts||[],pons:d.pons||[],wirelessDevices:d.wirelessDevices||[],plans:d.plans||[],offers:d.offers||{},notifications:d.notifications||[],payments:d.payments||[],complaints:d.complaints||[],referrals:d.referrals||[],upgrades:d.upgrades||[],passwordChangeRequests:d.passwordChangeRequests||[],inventory:d.inventory||[],inventoryMovements:d.inventoryMovements||[],settings:d.settings||{}};
+  await p.query('INSERT INTO rao_daily_backups(backup_date,payload) VALUES(?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),created_at=CURRENT_TIMESTAMP',[today,JSON.stringify(payload)]);
+  await p.query('DELETE FROM rao_daily_backups WHERE backup_date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)');
+  lastBackupDate=today;
+  console.log('Daily Rao Brothers backup saved:',today);
+ }catch(e){console.error('Daily backup error:',e.message)}
+}
+async function ensurePaymentSchema(){
+ const p=getPool();
+ const [[col]] = await p.query(`SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='payments' AND COLUMN_NAME='proof_path'`);
+ if(!Number(col.n)) await p.query(`ALTER TABLE payments ADD COLUMN proof_path LONGTEXT NULL AFTER utr`);
+}
 async function initDB(){
  try{
   await ensureWirelessSchema();
+  await ensurePaymentSchema();
+  await ensureBackupSchema();
   await loadDBFromMySQL();
+  await saveDailyBackup(dbCache);
   // Create one default technician only when the Workers table is empty, so the panel can be tested immediately.
   if(!Array.isArray(dbCache.workers) || dbCache.workers.length===0){
    dbCache.workers=[{id:'W001',name:'Main Technician',mobile:'',status:'Available',lat:null,lng:null,lastLocation:null,password:hashPassword('1234'),active:true}];
@@ -95,31 +121,37 @@ async function initDB(){
   console.log('GoDaddy MySQL connected. Customers:',dbCache.customers.length,'Workers:',dbCache.workers.length);
  }catch(e){console.error('GoDaddy MySQL connection failed:',e.message);throw e}
 }
+
+// Ensure a daily backup even on days with no writes. The hourly check creates exactly one backup per day and keeps 30 days.
+setInterval(()=>{ if(dbCache) saveDailyBackup(dbCache).catch(e=>console.error('scheduled backup error:',e.message)); },60*60*1000);
 function addMonths(date,n){const d=new Date(date.getFullYear(),date.getMonth(),date.getDate()),day=d.getDate();d.setDate(1);d.setMonth(d.getMonth()+n);const last=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();d.setDate(Math.min(day,last));return d}
 function iso(d){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return y+'-'+m+'-'+day}
 function send(res,status,data,type='application/json'){res.writeHead(status,{'Content-Type':type,'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});res.end(type==='application/json'?JSON.stringify(data):data)}
 function body(req){return new Promise((resolve,reject)=>{let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{resolve(b?JSON.parse(b):{})}catch(e){reject(e)}})})}
 function idOK(id){return /^RB\d+$/.test(String(id||'').trim().toUpperCase())}
-function addNotification(d,to,title,message,meta={}){d.notifications=d.notifications||[];d.notifications.push({id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:String(to||'ALL'),title:String(title||'Rao Brothers'),message:String(message||''),date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),...meta});if(d.notifications.length>500)d.notifications=d.notifications.slice(-500)}
+function addNotification(d,to,title,message,meta={}){d.notifications=d.notifications||[];d.notifications.push({id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:String(to||'ALL'),title:String(title||'Rao Brothers'),message:String(message||''),date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),...meta})}
 
 function runExpiryReminders(){
  try{
   const d=readDB(), now=new Date();
   const hour=now.getHours();
-  if(hour!==9 && hour!==19) return;
+  // Send one expiry reminder per day at 09:00. The customer gets 5,4,3,2,1-day reminders.
+  if(hour!==9) return;
   const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
   let changed=false;
   for(const c of d.customers||[]){
    if(!c.expiry || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiry)) continue;
+   if(Number(c.dueBalance||0)<=0) continue;
    const ex=new Date(c.expiry+'T00:00:00');
    const days=Math.round((ex-today)/86400000);
-   if(days<0 || days>5) continue;
+   if(days<1 || days>5) continue;
    const key=`EXPIRY:${c.id}:${c.expiry}:${days}:${hour}`;
    if((d.notifications||[]).some(n=>n.metaKey===key)) continue;
-   const msg=days===0
-    ? `⚠️ Aaj aapka plan expire ho raha hai. Due amount ₹${Number(c.dueBalance||0).toFixed(2)}. Please recharge karein.`
-    : `🔔 Aapka ${c.plan||'Internet'} plan ${days} din baad (${c.expiry}) khatam hone wala hai. Please recharge karein. Due amount ₹${Number(c.dueBalance||0).toFixed(2)}.`;
-   addNotification(d,c.id,'📅 Plan Expiry Reminder',msg,{metaKey:key});
+   const msg=`🔔 Aapka ${c.plan||'Internet'} plan ${days} din baad (${c.expiry}) khatam hone wala hai. Payment ₹${Number(c.dueBalance||0).toFixed(2)} pending hai. Please recharge/payment karein.`;
+   const reminder={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:c.id,title:'📅 Plan Expiry Reminder',message:msg,metaKey:key,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};
+   d.notifications=d.notifications||[]; d.notifications.push(reminder);
+   // Also send as a real browser/Android push notification (notification bar).
+   sendPushForNotification(d,reminder).catch(e=>console.error('expiry push error:',e.message));
    changed=true;
   }
   if(changed) persistDB(d);
@@ -132,7 +164,7 @@ if(u.pathname==='/api/health')return send(res,200,{ok:true,service:'Rao Brothers
 if(u.pathname==='/api/push/vapid-public-key'&&req.method==='GET'){const cfg=pushConfig();if(!cfg)return send(res,503,{error:'Push notifications are not configured on server'});return send(res,200,{publicKey:cfg.pub})}
 if(u.pathname==='/api/push/subscribe'&&req.method==='POST'){const x=await body(req),role=String(x.role||'').toUpperCase(),id=String(x.id||'').trim().toUpperCase(),sub=x.subscription;if(!['CUSTOMER','WORKER','ADMIN'].includes(role)||!id||!sub||!sub.endpoint)return send(res,400,{error:'Valid role, id and push subscription required'});const key=role+':'+id;d.pushSubscriptions=d.pushSubscriptions||[];d.pushSubscriptions=d.pushSubscriptions.filter(a=>!(a.key===key&&a.subscription?.endpoint===sub.endpoint));d.pushSubscriptions.push({id:'PS'+Date.now()+Math.random().toString(36).slice(2,7),key,subscription:sub,updatedAt:new Date().toISOString()});persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/admin/login'&&req.method==='POST'){const x=await body(req);const username=String(x.username||'').trim();let adminUser=String(d.settings?.admin_username||'admin');let stored=d.settings?.admin_password_hash||'';if(!stored){stored=hashPassword('1234');d.settings=d.settings||{};d.settings.admin_username=adminUser;d.settings.admin_password_hash=stored;persistDB(d);}if(username!==adminUser||!verifyPassword(String(x.password||''),stored))return send(res,401,{error:'Invalid Admin ID or Password'});return send(res,200,{ok:true,token:newSession('admin',adminUser),username:adminUser});}
-if(u.pathname==='/api/admin/change-password'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});const x=await body(req),old=String(x.currentPassword||''),nw=String(x.newPassword||'');const stored=d.settings?.admin_password_hash||'';if(!verifyPassword(old,stored))return send(res,401,{error:'Current admin password is incorrect'});if(nw.length<4)return send(res,400,{error:'New password must be at least 4 characters'});d.settings.admin_password_hash=hashPassword(nw);persistDB(d);return send(res,200,{ok:true,message:'Admin password changed successfully'});}
+if(u.pathname==='/api/admin/backup-status'&&req.method==='GET'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});try{const p=getPool(),[[x]]=await p.query('SELECT backup_date,created_at FROM rao_daily_backups ORDER BY backup_date DESC LIMIT 1');return send(res,200,{ok:true,lastBackup:x?.backup_date||null,createdAt:x?.created_at||null,retentionDays:30})}catch(e){return send(res,500,{error:e.message})}} if(u.pathname==='/api/admin/backup-now'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});try{lastBackupDate='';await saveDailyBackup(d);return send(res,200,{ok:true,message:'Backup saved successfully'})}catch(e){return send(res,500,{error:e.message})}} if(u.pathname==='/api/admin/change-password'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});const x=await body(req),old=String(x.currentPassword||''),nw=String(x.newPassword||'');const stored=d.settings?.admin_password_hash||'';if(!verifyPassword(old,stored))return send(res,401,{error:'Current admin password is incorrect'});if(nw.length<4)return send(res,400,{error:'New password must be at least 4 characters'});d.settings.admin_password_hash=hashPassword(nw);persistDB(d);return send(res,200,{ok:true,message:'Admin password changed successfully'});}
 if(u.pathname==='/api/worker/login'&&req.method==='POST'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),w=d.workers.find(a=>a.id===id);if(!w||w.active===false)return send(res,401,{error:'Invalid Worker ID or Password'});if(!verifyPassword(String(x.password||''),String(w.password||'')))return send(res,401,{error:'Invalid Worker ID or Password'});return send(res,200,{ok:true,token:newSession('worker',w.id),workerId:w.id,name:w.name});}
 if(u.pathname==='/api/worker/password'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});const x=await body(req),id=String(x.workerId||'').trim().toUpperCase(),nw=String(x.newPassword||'');const w=d.workers.find(a=>a.id===id);if(!w)return send(res,404,{error:'Worker not found'});if(nw.length<4)return send(res,400,{error:'Password must be at least 4 characters'});w.password=hashPassword(nw);persistDB(d);return send(res,200,{ok:true,workerId:id,message:'Worker password updated'});}
 if(u.pathname==='/api/settings'&&req.method==='GET')return send(res,200,d.settings);
@@ -209,7 +241,15 @@ if(u.pathname==='/api/admin/service-credit'&&req.method==='POST'){
  c.startDate=c.startDate||iso(today);c.expiry=newExpiry;c.status='Active';c.months=months;
  const item={id:'LED'+Date.now(),type:mode,description:String(x.description||('Service recharge '+months+' month(s)')),amount:price,months,date:new Date().toISOString(),status:mode==='Cash'?'Paid':'Pending'};
  c.dueItems=c.dueItems||[];
- if(mode==='Udhaar'){c.dueBalance=Number(c.dueBalance||0)+price;c.dueItems.push(item);addNotification(d,c.id,'🧾 Recharge on Credit / Udhaar',`Your ${months} month recharge is active until ${c.expiry}. Pending payment: ₹${c.dueBalance}.`);}
+ if(mode==='Udhaar'){
+   c.dueBalance=Number(c.dueBalance||0)+price;c.dueItems.push(item);
+   const n={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:c.id,title:'🧾 Payment Pending',message:`Aapka ${months} month recharge active kar diya gaya hai. Pending payment ₹${c.dueBalance}. Kripya payment jaldi karein.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),metaKey:'UDHAAR:'+item.id};
+   d.notifications.push(n);
+   sendPushForNotification(d,n).catch(e=>console.error('udhaar customer push error:',e.message));
+   const an={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:'ADMIN',title:'🧾 Payment Pending / Udhaar Recharge',message:`${c.name} (${c.id}) ka ${months} month recharge ₹${price} par activate hua hai, lekin payment pending hai. Total pending due ₹${c.dueBalance}. Note: ${item.description}`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),metaKey:'UDHAAR_ADMIN:'+item.id};
+   d.notifications.push(an);
+   sendPushForNotification(d,an).catch(e=>console.error('udhaar admin push error:',e.message));
+ }
  else {item.status='Paid';c.dueItems.push(item);addNotification(d,c.id,'💵 Cash Payment Recorded',`Cash payment of ₹${price} recorded. Your plan is active until ${c.expiry}.`);}
  persistDB(d);return send(res,200,{customer:c,item});
 }
@@ -245,7 +285,7 @@ if(u.pathname==='/api/payment'&&req.method==='POST'){
  const utr=String(x.utr||'').trim(),payerName=String(x.payerName||c.name||'').trim(),proof=String(x.proofImage||'').trim();
  if(!utr&&!proof)return send(res,400,{error:'Please provide UTR OR payment screenshot.'});
  if(proof && proof.length>4000000)return send(res,400,{error:'Payment screenshot is too large. Please use a smaller image.'});
- const p={id:'PAY'+Date.now(),customerId,customerName:c.name,amount,months,status:'Pending',date:new Date().toISOString(),utr,payerName,proofImage:proof||null};
+ const p={id:'PAY'+Date.now(),customerId,customerName:c.name,amount,months,paidMonths:months,status:'Pending',date:new Date().toISOString(),utr,payerName,proofImage:proof||null,proofPath:proof||null};
  d.payments.push(p);const an={id:'NT'+Date.now(),to:'ADMIN',title:'💳 New Payment Received',message:`${c.name} (${customerId}) submitted ₹${amount}. ${utr?'UTR: '+utr+'. ':''}${proof?'Payment screenshot attached. ':''}Please verify payment.`,metaKey:'PAYMENT:'+p.id,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};d.notifications.push(an);persistDB(d);sendPushForNotification(d,an).catch(e=>console.error('payment push error:',e.message));return send(res,200,p)
 }
 if(u.pathname==='/api/payment'&&req.method==='DELETE'){const id=String(u.searchParams.get('id')||'').trim();const before=d.payments.length;d.payments=d.payments.filter(p=>p.id!==id);if(d.payments.length===before)return send(res,404,{error:'Payment not found'});persistDB(d);return send(res,200,{ok:true})}
@@ -255,7 +295,35 @@ if(u.pathname==='/api/payment/approve'&&req.method==='POST'){
  const x=await body(req),p=d.payments.find(a=>a.id===x.id);if(!p)return send(res,404,{error:'Payment not found'});
  if(p.status==='Approved')return send(res,200,p);
  p.status='Approved';p.approvedAt=new Date().toISOString();const c=d.customers.find(a=>a.id===p.customerId);
- if(c){const start=new Date(),credit=Math.min(Number(c.credit||0),Number(p.amount||0));c.credit=Math.max(0,Number(c.credit||0)-credit);c.startDate=iso(start);c.expiry=iso(addMonths(start,Math.max(1,p.months||1)));c.status='Active';const pn={id:'NT'+Date.now(),to:c.id,title:'✅ Payment Approved',message:`Your payment of ₹${p.amount} has been approved. Your plan is active until ${c.expiry}.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};d.notifications.push(pn);sendPushForNotification(d,pn).catch(e=>console.error('payment approval push error:',e.message));}
+ if(c){
+  const start=new Date();
+  const payAmount=Number(p.amount||0);
+  const credit=Math.min(Number(c.credit||0),payAmount);
+  c.credit=Math.max(0,Number(c.credit||0)-credit);
+  let remainingPay=Math.max(0,payAmount-credit);
+  c.dueBalance=Math.max(0,Number(c.dueBalance||0));
+  c.dueItems=Array.isArray(c.dueItems)?c.dueItems:[];
+  // Apply an approved payment to the oldest pending dues first.
+  for(const item of c.dueItems){
+    if(remainingPay<=0) break;
+    if(String(item.status||'Pending')!=='Pending') continue;
+    const itemDue=Math.max(0,Number(item.amount||0));
+    if(!itemDue) { item.status='Paid'; continue; }
+    const applied=Math.min(itemDue,remainingPay);
+    item.amount=itemDue-applied;
+    item.paidAmount=Number(item.paidAmount||0)+applied;
+    if(item.amount<=0){item.amount=0;item.status='Paid';item.paidAt=new Date().toISOString();}
+    remainingPay-=applied;
+  }
+  c.dueBalance=Math.max(0,Number(c.dueBalance||0)-Math.max(0,payAmount-credit-remainingPay));
+  if(c.dueBalance<=0)c.dueBalance=0;
+  const months=Math.max(1,Number(p.months||p.paidMonths||1));
+  c.startDate=iso(start);
+  c.expiry=iso(addMonths(start,months));
+  c.status='Active';
+  const pn={id:'NT'+Date.now(),to:c.id,title:'✅ Payment Approved',message:`Your payment of ₹${p.amount} has been approved. Remaining pending payment: ₹${c.dueBalance}. Your plan is active until ${c.expiry}.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};
+  d.notifications.push(pn);sendPushForNotification(d,pn).catch(e=>console.error('payment approval push error:',e.message));
+}
  persistDB(d);return send(res,200,p)
 }
 if(u.pathname==='/api/workers'&&req.method==='GET')return send(res,200,d.workers);
