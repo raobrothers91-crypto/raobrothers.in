@@ -1,15 +1,25 @@
-const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
+const http=require('http'),fs=require('fs'),path=require('path');
 const mysql=require('mysql2/promise');
-let webpush=null; try{webpush=require('web-push')}catch(e){console.warn('web-push module unavailable; push notifications disabled until npm install completes.')}
+let firebaseAdmin=null;
+let fcmReady=false;
+function initFCM(){
+ try{
+  const projectId=String(process.env.FIREBASE_PROJECT_ID||'').trim();
+  const clientEmail=String(process.env.FIREBASE_CLIENT_EMAIL||'').trim();
+  const privateKey=String(process.env.FIREBASE_PRIVATE_KEY||'').replace(/\\n/g,'\n');
+  if(!projectId||!clientEmail||!privateKey){console.warn('FCM disabled: Firebase environment variables are incomplete.');return false;}
+  firebaseAdmin=require('firebase-admin');
+  if(!firebaseAdmin.apps.length) firebaseAdmin.initializeApp({credential:firebaseAdmin.credential.cert({projectId,clientEmail,privateKey})});
+  fcmReady=true;
+  console.log('Firebase FCM ready.');
+  return true;
+ }catch(e){console.error('Firebase FCM initialization failed:',e.message);return false;}
+}
+
 const PORT=process.env.PORT||3000;
 let dbCache=null;
 let persistQueue=Promise.resolve();
 let pool=null;
-const sessions=new Map();
-function hashPassword(p,salt){const s=salt||crypto.randomBytes(16).toString('hex');return `scrypt$${s}$${crypto.scryptSync(String(p),s,64).toString('hex')}`;}
-function verifyPassword(p,stored){if(!stored)return false; if(stored.startsWith('scrypt$')){const a=stored.split('$');if(a.length!==3)return false;const got=crypto.scryptSync(String(p),a[1],64);const want=Buffer.from(a[2],'hex');return got.length===want.length&&crypto.timingSafeEqual(got,want);} return String(stored)===String(p);}
-function newSession(role,id){const token=crypto.randomBytes(32).toString('hex');sessions.set(token,{role,id,createdAt:Date.now()});return token;}
-function session(req,role){const t=String(req.headers['x-auth-token']||'');const x=sessions.get(t);return x&&x.role===role?x:null;}
 function getPool(){
  if(pool) return pool;
  const required=['DB_HOST','DB_PORT','DB_NAME','DB_USER','DB_PASSWORD'];
@@ -19,51 +29,39 @@ function getPool(){
  return pool;
 }
 
-function fresh(){return {workers:[],olts:[],pons:[],wirelessDevices:[],customers:[],plans:[],offers:{},notifications:[],payments:[],complaints:[],referrals:[],upgrades:[],passwordChangeRequests:[],inventory:[],inventoryMovements:[],pushSubscriptions:[],settings:{upi:'8675938000@axl'}}}
-function pushConfig(){const pub=String(process.env.VAPID_PUBLIC_KEY||'').trim(),priv=String(process.env.VAPID_PRIVATE_KEY||'').trim(),sub=String(process.env.VAPID_SUBJECT||'mailto:admin@raobrothers.in').trim();if(!webpush||!pub||!priv)return null;try{webpush.setVapidDetails(sub,pub,priv);return {pub,priv,sub}}catch(e){console.error('VAPID config error:',e.message);return null}}
-async function sendPush(d,to,title,message,url='/'){const cfg=pushConfig();if(!cfg)return;const key=String(to||'').toUpperCase();const targets=(d.pushSubscriptions||[]).filter(x=>x&&x.key===key || x&&x.key==='ALL');const payload=JSON.stringify({title:String(title||'Rao Brothers'),body:String(message||''),url:String(url||'/'),tag:'rao-'+Date.now()});const dead=new Set();await Promise.all(targets.map(async x=>{try{await webpush.sendNotification(x.subscription,payload)}catch(e){if([404,410].includes(Number(e.statusCode)))dead.add(x.id)}}));if(dead.size){d.pushSubscriptions=d.pushSubscriptions.filter(x=>!dead.has(x.id));persistDB(d)}}
-async function sendPushForNotification(d,n){const to=String(n.to||'').toUpperCase();const jobs=[];if(to==='ALL'){for(const x of (d.pushSubscriptions||[])){if(x.key.startsWith('CUSTOMER:'))jobs.push(sendPush(d,x.key,n.title,n.message,'/customer.html'))}}else if(to.startsWith('OLT:')||to.startsWith('PON:')){for(const c of d.customers||[]){if((to.startsWith('OLT:')&&String(c.oltId||'').toUpperCase()===to.slice(4))||(to.startsWith('PON:')&&String(c.ponId||'').toUpperCase()===to.slice(4)))jobs.push(sendPush(d,'CUSTOMER:'+c.id,n.title,n.message,'/customer.html'))}}else if(/^W\d+$/i.test(to)){jobs.push(sendPush(d,'WORKER:'+to,n.title,n.message,'/worker.html'))}else if(/^RB\d+$/i.test(to)){jobs.push(sendPush(d,'CUSTOMER:'+to,n.title,n.message,'/customer.html'))}else if(to==='ADMIN'){jobs.push(sendPush(d,'ADMIN:ADMIN',n.title,n.message,'/admin'))}await Promise.all(jobs)}
+function fresh(){return {workers:[],olts:[],pons:[],customers:[],plans:[],offers:{},notifications:[],payments:[],complaints:[],referrals:[],upgrades:[],passwordChangeRequests:[],settings:{upi:'8675938000@axl'}}}
 
-function rowCustomer(r){return {id:r.id,name:r.name,mobile:r.mobile,address:r.address,pppoe:r.pppoe,oltId:r.olt_id,ponId:r.pon_id,wirelessDeviceId:r.wireless_device_id||null,plan:r.plan,price:Number(r.price||0),startDate:r.start_date?String(r.start_date).slice(0,10):null,expiry:r.expiry?String(r.expiry).slice(0,10):null,activationDate:r.activation_date?String(r.activation_date).slice(0,10):null,totalPlanMonths:r.total_plan_months==null?null:Number(r.total_plan_months),usedMonths:r.used_months==null?null:Number(r.used_months),remainingMonths:r.remaining_months==null?null:Number(r.remaining_months),status:r.status,password:r.password,passwordChangeCount:Number(r.password_change_count||0),passwordChangeAllowed:!!r.password_change_allowed,blocked:!!r.blocked,credit:Number(r.credit||0),dueBalance:Number(r.due_balance||0),dueItems:r.due_items||[],isExistingCustomer:!!r.is_existing_customer,referralCode:r.referral_code}}
+function rowCustomer(r){return {id:r.id,name:r.name,mobile:r.mobile,address:r.address,pppoe:r.pppoe,oltId:r.olt_id,ponId:r.pon_id,plan:r.plan,price:Number(r.price||0),startDate:r.start_date?String(r.start_date).slice(0,10):null,expiry:r.expiry?String(r.expiry).slice(0,10):null,activationDate:r.activation_date?String(r.activation_date).slice(0,10):null,totalPlanMonths:r.total_plan_months==null?null:Number(r.total_plan_months),usedMonths:r.used_months==null?null:Number(r.used_months),remainingMonths:r.remaining_months==null?null:Number(r.remaining_months),status:r.status,password:r.password,passwordChangeCount:Number(r.password_change_count||0),passwordChangeAllowed:!!r.password_change_allowed,blocked:!!r.blocked,credit:Number(r.credit||0),dueBalance:Number(r.due_balance||0),dueItems:r.due_items||[],isExistingCustomer:!!r.is_existing_customer,referralCode:r.referral_code}}
 function rowComplaint(r){return {id:r.id,customerId:r.customer_id,type:r.type,message:r.message,status:r.status,priority:r.priority,workerId:r.worker_id,workerName:r.worker_name,customerLat:r.customer_lat==null?null:Number(r.customer_lat),customerLng:r.customer_lng==null?null:Number(r.customer_lng),technicianDone:!!r.technician_done,technicianDoneAt:r.technician_done_at,customerConfirmed:!!r.customer_confirmed,customerConfirmedAt:r.customer_confirmed_at,assignedAt:r.assigned_at,onTheWayAt:r.on_the_way_at,workStartedAt:r.work_started_at,expectedVisitAt:r.expected_visit_at,workNote:r.work_note,materials:r.materials,beforePhoto:r.before_photo,afterPhoto:r.after_photo,locationUpdatedAt:r.location_updated_at,resolvedAt:r.resolved_at,createdAt:r.created_at,updatedAt:r.updated_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
-function rowNotification(r){return {id:r.id,to:r.recipient_type==='CUSTOMER'?r.recipient_id:r.recipient_type==='WORKER'?r.recipient_id:r.recipient_type==='OLT'?'OLT:'+r.recipient_id:r.recipient_type==='PON'?'PON:'+r.recipient_id:r.recipient_type,title:r.title,message:r.message,metaKey:r.meta_key,createdAt:r.created_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
+function rowNotification(r){return {id:r.id,to:r.recipient_type==='CUSTOMER'?r.recipient_id:r.recipient_type==='OLT'?'OLT:'+r.recipient_id:r.recipient_type==='PON'?'PON:'+r.recipient_id:r.recipient_type,title:r.title,message:r.message,metaKey:r.meta_key,createdAt:r.created_at,date:r.created_at?new Date(r.created_at).toLocaleString('en-IN'):''}}
 async function loadDBFromMySQL(){
  const p=getPool(), d=fresh();
- const [[workers],[olts],[pons],[wirelessDevices],[customers],[plans],[offers],[notifications],[payments],[complaints],[referrals],[upgrades],[passwordChangeRequests],[settings]] = await Promise.all([
-  p.query('SELECT * FROM workers ORDER BY created_at,id'),p.query('SELECT * FROM olts ORDER BY created_at,id'),p.query('SELECT * FROM pons ORDER BY created_at,id'),p.query('SELECT * FROM wireless_devices ORDER BY created_at,id'),p.query('SELECT * FROM customers ORDER BY created_at,id'),p.query('SELECT * FROM plans ORDER BY id'),p.query('SELECT * FROM offers ORDER BY created_at DESC'),p.query('SELECT * FROM notifications ORDER BY created_at DESC'),p.query('SELECT * FROM payments ORDER BY created_at DESC'),p.query('SELECT * FROM complaints ORDER BY created_at DESC'),p.query('SELECT * FROM referrals ORDER BY created_at DESC'),p.query('SELECT * FROM upgrades ORDER BY created_at DESC'),p.query('SELECT * FROM password_change_requests ORDER BY requested_at DESC'),p.query('SELECT * FROM settings')
+ const [[workers],[olts],[pons],[customers],[plans],[offers],[notifications],[payments],[complaints],[referrals],[upgrades],[passwordChangeRequests],[settings]] = await Promise.all([
+  p.query('SELECT * FROM workers ORDER BY created_at,id'),p.query('SELECT * FROM olts ORDER BY created_at,id'),p.query('SELECT * FROM pons ORDER BY created_at,id'),p.query('SELECT * FROM customers ORDER BY created_at,id'),p.query('SELECT * FROM plans ORDER BY id'),p.query('SELECT * FROM offers ORDER BY created_at DESC'),p.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 500'),p.query('SELECT * FROM payments ORDER BY created_at DESC'),p.query('SELECT * FROM complaints ORDER BY created_at DESC'),p.query('SELECT * FROM referrals ORDER BY created_at DESC'),p.query('SELECT * FROM upgrades ORDER BY created_at DESC'),p.query('SELECT * FROM password_change_requests ORDER BY requested_at DESC'),p.query('SELECT * FROM settings')
  ]);
  d.workers=workers.map(r=>({id:r.id,name:r.name,mobile:r.mobile,status:r.status,lat:r.lat==null?null:Number(r.lat),lng:r.lng==null?null:Number(r.lng),lastLocation:r.last_location,password:r.password,active:!!r.active}));
- d.olts=olts; d.pons=pons.map(r=>({id:r.id,oltId:r.olt_id,name:r.name})); d.wirelessDevices=wirelessDevices.map(r=>({id:r.id,name:r.name,brand:r.brand||'',model:r.model||'',ip:r.ip||'',location:r.location||'',type:r.type||'',notes:r.notes||'',active:!!r.active})); d.customers=customers.map(rowCustomer); d.plans=plans.map(r=>({id:r.id,name:r.name,price:Number(r.price||0),active:!!r.active}));
+ d.olts=olts; d.pons=pons.map(r=>({id:r.id,oltId:r.olt_id,name:r.name})); d.customers=customers.map(rowCustomer); d.plans=plans.map(r=>({id:r.id,name:r.name,price:Number(r.price||0),active:!!r.active}));
  for(const r of offers){ if(!d.offers[r.customer_id]||r.created_at>d.offers[r.customer_id].created_at)d.offers[r.customer_id]={id:r.id,customerId:r.customer_id,title:r.title,message:r.message,paidMonths:Number(r.paid_months||1),freeMonths:Number(r.free_months||0),active:!!r.active,paidUntil:r.paid_until?String(r.paid_until).slice(0,10):null,serviceUntil:r.service_until?String(r.service_until).slice(0,10):null,createdAt:r.created_at}; }
  d.notifications=notifications.map(rowNotification); d.payments=payments.map(r=>({id:r.id,customerId:r.customer_id,customerName:r.customer_name,amount:Number(r.amount||0),method:r.method,utr:r.utr,proofPath:r.proof_path,status:r.status,paidMonths:r.paid_months==null?null:Number(r.paid_months),freeMonths:r.free_months==null?null:Number(r.free_months),notes:r.notes,createdAt:r.created_at,approvedAt:r.approved_at}));
  d.complaints=complaints.map(rowComplaint); d.referrals=referrals.map(r=>({id:r.id,referrerCustomerId:r.referrer_customer_id,newCustomerId:r.new_customer_id,newCustomerName:r.new_customer_name,newCustomerMobile:r.new_customer_mobile,referrerBenefit:Number(r.referrer_benefit||0),newCustomerBenefit:Number(r.new_customer_benefit||0),status:r.status,approvedAt:r.approved_at,rejectedAt:r.rejected_at,createdAt:r.created_at})); d.upgrades=upgrades.map(r=>({id:r.id,customerId:r.customer_id,customerName:r.customer_name,currentPlan:r.current_plan,currentPrice:Number(r.current_price||0),requestedPlan:r.requested_plan,requestedPrice:Number(r.requested_price||0),status:r.status,createdAt:r.created_at,approvedAt:r.approved_at,rejectedAt:r.rejected_at})); d.passwordChangeRequests=passwordChangeRequests.map(r=>({id:r.id,customerId:r.customer_id,customerName:r.customer_name,status:r.status,requestedAt:r.requested_at,approvedAt:r.approved_at,rejectedAt:r.rejected_at}));
  for(const r of settings)d.settings[r.setting_key]=r.setting_value;
- try{d.inventory=JSON.parse(d.settings.inventory_json||'[]');}catch{d.inventory=[]}
- try{d.inventoryMovements=JSON.parse(d.settings.inventory_movements_json||'[]');}catch{d.inventoryMovements=[]}
- try{d.pushSubscriptions=JSON.parse(d.settings.push_subscriptions_json||'[]');}catch{d.pushSubscriptions=[]}
- delete d.settings.inventory_json; delete d.settings.inventory_movements_json; delete d.settings.push_subscriptions_json;
  dbCache=d; return d;
 }
 function readDB(){ if(!dbCache) dbCache=fresh(); return dbCache; }
 function persistDB(d){
  dbCache=d;
- d.settings=d.settings||{};
- d.settings.inventory_json=JSON.stringify(d.inventory||[]);
- d.settings.inventory_movements_json=JSON.stringify(d.inventoryMovements||[]);
- d.settings.push_subscriptions_json=JSON.stringify(d.pushSubscriptions||[]);
  persistQueue=persistQueue.then(async()=>{
   const p=getPool(),c=await p.getConnection();
   try{
    await c.beginTransaction();
-   const tables=['password_change_requests','upgrades','referrals','complaints','payments','notifications','offers','customers','wireless_devices','pons','olts','workers','plans','settings'];
+   const tables=['password_change_requests','upgrades','referrals','complaints','payments','notifications','offers','customers','pons','olts','workers','plans','settings'];
    for(const t of tables) await c.query('DELETE FROM '+t);
    for(const x of d.settings||{}) await c.query('INSERT INTO settings(setting_key,setting_value) VALUES(?,?)',[x,String(d.settings[x]??'')]);
    for(const r of d.plans||[]) await c.query('INSERT INTO plans(id,name,price,active) VALUES(?,?,?,?)',[r.id||null,r.name,Number(r.price||0),r.active===false?0:1]);
    for(const r of d.workers||[]) await c.query('INSERT INTO workers(id,name,mobile,status,lat,lng,last_location,password,active) VALUES(?,?,?,?,?,?,?,?,?)',[r.id,r.name,r.mobile||null,r.status||'Available',r.lat??null,r.lng??null,r.lastLocation?new Date(r.lastLocation):null,r.password||null,r.active===false?0:1]);
    for(const r of d.olts||[]) await c.query('INSERT INTO olts(id,name,location) VALUES(?,?,?)',[r.id,r.name,r.location||null]);
    for(const r of d.pons||[]) await c.query('INSERT INTO pons(id,olt_id,name) VALUES(?,?,?)',[r.id,r.oltId,r.name]);
-   for(const r of d.wirelessDevices||[]) await c.query('INSERT INTO wireless_devices(id,name,brand,model,ip,location,type,notes,active) VALUES(?,?,?,?,?,?,?,?,?)',[r.id,r.name,r.brand||null,r.model||null,r.ip||null,r.location||null,r.type||null,r.notes||null,r.active===false?0:1]);
-   for(const r of d.customers||[]) await c.query('INSERT INTO customers(id,name,mobile,address,pppoe,olt_id,pon_id,wireless_device_id,plan,price,start_date,expiry,activation_date,total_plan_months,used_months,remaining_months,status,password,password_change_count,password_change_allowed,blocked,credit,due_balance,due_items,is_existing_customer,referral_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[r.id,r.name,r.mobile||null,r.address||null,r.pppoe||null,r.oltId||null,r.ponId||null,r.wirelessDeviceId||null,r.plan||null,Number(r.price||0),r.startDate||null,r.expiry||null,r.activationDate||null,r.totalPlanMonths??null,r.usedMonths??null,r.remainingMonths??null,r.status||'Active',r.password||null,Number(r.passwordChangeCount||0),r.passwordChangeAllowed?1:0,r.blocked?1:0,Number(r.credit||0),Number(r.dueBalance||0),JSON.stringify(r.dueItems||[]),r.isExistingCustomer?1:0,r.referralCode||null]);
+   for(const r of d.customers||[]) await c.query('INSERT INTO customers(id,name,mobile,address,pppoe,olt_id,pon_id,plan,price,start_date,expiry,activation_date,total_plan_months,used_months,remaining_months,status,password,password_change_count,password_change_allowed,blocked,credit,due_balance,due_items,is_existing_customer,referral_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[r.id,r.name,r.mobile||null,r.address||null,r.pppoe||null,r.oltId||null,r.ponId||null,r.plan||null,Number(r.price||0),r.startDate||null,r.expiry||null,r.activationDate||null,r.totalPlanMonths??null,r.usedMonths??null,r.remainingMonths??null,r.status||'Active',r.password||null,Number(r.passwordChangeCount||0),r.passwordChangeAllowed?1:0,r.blocked?1:0,Number(r.credit||0),Number(r.dueBalance||0),JSON.stringify(r.dueItems||[]),r.isExistingCustomer?1:0,r.referralCode||null]);
    for(const r of Object.values(d.offers||{})) await c.query('INSERT INTO offers(id,customer_id,title,message,paid_months,free_months,active,paid_until,service_until,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',[r.id||('OF'+Date.now()),r.customerId,r.title,r.message||'',Number(r.paidMonths||1),Number(r.freeMonths||0),r.active===false?0:1,r.paidUntil||null,r.serviceUntil||null,r.createdAt?new Date(r.createdAt):new Date()]);
    for(const r of d.notifications||[]) { const to=String(r.to||'ALL'); let rt='ALL',ri=null; if(to.startsWith('OLT:')){rt='OLT';ri=to.slice(4)}else if(to.startsWith('PON:')){rt='PON';ri=to.slice(4)}else if(/^RB\\d+$/i.test(to)){rt='CUSTOMER';ri=to.toUpperCase()} else if(to==='ADMIN'){rt='ADMIN'} await c.query('INSERT INTO notifications(id,recipient_type,recipient_id,title,message,meta_key,created_at) VALUES(?,?,?,?,?,?,?)',[r.id,rt,ri,r.title,r.message||'',r.metaKey||null,r.createdAt?new Date(r.createdAt):new Date()]); }
    for(const r of d.payments||[]) await c.query('INSERT INTO payments(id,customer_id,customer_name,amount,method,utr,proof_path,status,paid_months,free_months,notes,created_at,approved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',[r.id,r.customerId,r.customerName||null,Number(r.amount||0),r.method||null,r.utr||null,r.proofPath||r.proofImage||null,r.status||'Pending',r.paidMonths??r.months??null,r.freeMonths??null,r.notes||null,r.createdAt?new Date(r.createdAt):new Date(),r.approvedAt?new Date(r.approvedAt):null]);
@@ -72,86 +70,75 @@ function persistDB(d){
    for(const r of d.upgrades||[]) await c.query('INSERT INTO upgrades(id,customer_id,customer_name,current_plan,current_price,requested_plan,requested_price,status,created_at,approved_at,rejected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',[r.id,r.customerId,r.customerName||null,r.currentPlan||null,r.currentPrice??null,r.requestedPlan||null,r.requestedPrice??null,r.status||'Pending',r.createdAt?new Date(r.createdAt):new Date(),r.approvedAt?new Date(r.approvedAt):null,r.rejectedAt?new Date(r.rejectedAt):null]);
    for(const r of d.passwordChangeRequests||[]) await c.query('INSERT INTO password_change_requests(id,customer_id,customer_name,status,requested_at,approved_at,rejected_at) VALUES(?,?,?,?,?,?,?)',[r.id,r.customerId,r.customerName||null,r.status||'Pending',r.requestedAt?new Date(r.requestedAt):new Date(),r.approvedAt?new Date(r.approvedAt):null,r.rejectedAt?new Date(r.rejectedAt):null]);
    await c.commit();
-   await saveDailyBackup(d);
   }catch(e){await c.rollback();console.error('MySQL persist error:',e.message);throw e}finally{c.release()}
  }).catch(e=>console.error('MySQL queue error:',e.message));
  return persistQueue;
 }
-async function ensureWirelessSchema(){
- const p=getPool();
- await p.query(`CREATE TABLE IF NOT EXISTS wireless_devices (id VARCHAR(32) PRIMARY KEY,name VARCHAR(150) NOT NULL,brand VARCHAR(100) NULL,model VARCHAR(100) NULL,ip VARCHAR(64) NULL,location VARCHAR(255) NULL,type VARCHAR(100) NULL,notes TEXT NULL,active TINYINT(1) NOT NULL DEFAULT 1,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
- const [[col]] = await p.query(`SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='customers' AND COLUMN_NAME='wireless_device_id'`);
- if(!Number(col.n)) await p.query(`ALTER TABLE customers ADD COLUMN wireless_device_id VARCHAR(32) NULL AFTER pon_id`);
-}
-let lastBackupDate='';
-async function ensureBackupSchema(){
- const p=getPool();
- await p.query(`CREATE TABLE IF NOT EXISTS rao_daily_backups (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,backup_date DATE NOT NULL UNIQUE,payload LONGTEXT NOT NULL,created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-}
-async function saveDailyBackup(d){
- try{
-  const today=iso(new Date());
-  if(lastBackupDate===today) return;
-  const p=getPool();
-  const payload={version:1,backupDate:today,createdAt:new Date().toISOString(),customers:d.customers||[],workers:d.workers||[],olts:d.olts||[],pons:d.pons||[],wirelessDevices:d.wirelessDevices||[],plans:d.plans||[],offers:d.offers||{},notifications:d.notifications||[],payments:d.payments||[],complaints:d.complaints||[],referrals:d.referrals||[],upgrades:d.upgrades||[],passwordChangeRequests:d.passwordChangeRequests||[],inventory:d.inventory||[],inventoryMovements:d.inventoryMovements||[],settings:d.settings||{}};
-  await p.query('INSERT INTO rao_daily_backups(backup_date,payload) VALUES(?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),created_at=CURRENT_TIMESTAMP',[today,JSON.stringify(payload)]);
-  await p.query('DELETE FROM rao_daily_backups WHERE backup_date < DATE_SUB(CURDATE(), INTERVAL 30 DAY)');
-  lastBackupDate=today;
-  console.log('Daily Rao Brothers backup saved:',today);
- }catch(e){console.error('Daily backup error:',e.message)}
-}
-async function ensurePaymentSchema(){
- const p=getPool();
- const [[col]] = await p.query(`SELECT COUNT(*) AS n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='payments' AND COLUMN_NAME='proof_path'`);
- if(!Number(col.n)) await p.query(`ALTER TABLE payments ADD COLUMN proof_path LONGTEXT NULL AFTER utr`);
-}
 async function initDB(){
  try{
-  await ensureWirelessSchema();
-  await ensurePaymentSchema();
-  await ensureBackupSchema();
+  const p=getPool();
+  await p.query(`CREATE TABLE IF NOT EXISTS customer_push_tokens (id BIGINT AUTO_INCREMENT PRIMARY KEY, customer_id VARCHAR(64) NOT NULL, token TEXT NOT NULL, token_hash CHAR(64) NOT NULL UNIQUE, platform VARCHAR(32) DEFAULT 'android', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, INDEX idx_customer_push_tokens_customer (customer_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
   await loadDBFromMySQL();
-  await saveDailyBackup(dbCache);
-  // Create one default technician only when the Workers table is empty, so the panel can be tested immediately.
-  if(!Array.isArray(dbCache.workers) || dbCache.workers.length===0){
-   dbCache.workers=[{id:'W001',name:'Main Technician',mobile:'',status:'Available',lat:null,lng:null,lastLocation:null,password:hashPassword('1234'),active:true}];
-   await persistDB(dbCache);
-   console.log('Default worker created: W001 / 1234');
-  }
-  console.log('GoDaddy MySQL connected. Customers:',dbCache.customers.length,'Workers:',dbCache.workers.length);
+  initFCM();
+  console.log('GoDaddy MySQL connected. Customers:',dbCache.customers.length);
  }catch(e){console.error('GoDaddy MySQL connection failed:',e.message);throw e}
 }
-
-// Ensure a daily backup even on days with no writes. The hourly check creates exactly one backup per day and keeps 30 days.
-setInterval(()=>{ if(dbCache) saveDailyBackup(dbCache).catch(e=>console.error('scheduled backup error:',e.message)); },60*60*1000);
 function addMonths(date,n){const d=new Date(date.getFullYear(),date.getMonth(),date.getDate()),day=d.getDate();d.setDate(1);d.setMonth(d.getMonth()+n);const last=new Date(d.getFullYear(),d.getMonth()+1,0).getDate();d.setDate(Math.min(day,last));return d}
 function iso(d){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return y+'-'+m+'-'+day}
 function send(res,status,data,type='application/json'){res.writeHead(status,{'Content-Type':type,'Access-Control-Allow-Origin':'*','Access-Control-Allow-Methods':'GET,POST,PUT,DELETE,OPTIONS','Access-Control-Allow-Headers':'Content-Type'});res.end(type==='application/json'?JSON.stringify(data):data)}
 function body(req){return new Promise((resolve,reject)=>{let b='';req.on('data',c=>b+=c);req.on('end',()=>{try{resolve(b?JSON.parse(b):{})}catch(e){reject(e)}})})}
 function idOK(id){return /^RB\d+$/.test(String(id||'').trim().toUpperCase())}
-function addNotification(d,to,title,message,meta={}){d.notifications=d.notifications||[];d.notifications.push({id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:String(to||'ALL'),title:String(title||'Rao Brothers'),message:String(message||''),date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),...meta})}
+const crypto=require('crypto');
+async function registerPushToken(customerId,token,platform='android'){
+ const id=String(customerId||'').trim().toUpperCase(),t=String(token||'').trim();
+ if(!idOK(id)||!t) throw new Error('Valid customerId and token are required');
+ const p=getPool(),hash=crypto.createHash('sha256').update(t).digest('hex');
+ await p.query(`INSERT INTO customer_push_tokens(customer_id,token,token_hash,platform) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE customer_id=VALUES(customer_id),token=VALUES(token),platform=VALUES(platform),updated_at=CURRENT_TIMESTAMP`,[id,t,hash,String(platform||'android')]);
+ return {ok:true,customerId:id};
+}
+async function sendPush(to,title,message,meta={}){
+ if(!fcmReady) return;
+ try{
+  const p=getPool();
+  let sql='SELECT id,customer_id,token FROM customer_push_tokens WHERE 1=1',args=[];
+  const target=String(to||'ALL').toUpperCase();
+  if(/^RB\d+$/.test(target)){sql+=' AND customer_id=?';args.push(target);}
+  else if(target.startsWith('OLT:')){sql+=" AND customer_id IN (SELECT id FROM customers WHERE UPPER(COALESCE(olt_id,''))=? )";args.push(target.slice(4));}
+  else if(target.startsWith('PON:')){sql+=" AND customer_id IN (SELECT id FROM customers WHERE UPPER(COALESCE(pon_id,''))=? )";args.push(target.slice(4));}
+  else if(target==='ALL'){/* all customer tokens */}
+  else return;
+  const [rows]=await p.query(sql,args);
+  if(!rows.length)return;
+  const data={title:String(title||'Rao Brothers'),message:String(message||''),to:target,deepLink:'https://app.raobrothers.in/',...Object.fromEntries(Object.entries(meta||{}).filter(([k,v])=>v!==undefined&&v!==null).map(([k,v])=>[k,String(v)]))};
+  for(let i=0;i<rows.length;i+=500){
+   const batch=rows.slice(i,i+500);
+   const result=await firebaseAdmin.messaging().sendEachForMulticast({tokens:batch.map(r=>r.token),notification:{title:data.title,body:data.message},data,android:{priority:'high',notification:{channelId:'rao_brothers_alerts',sound:'default',defaultSound:true,defaultVibrateTimings:true}},apns:{payload:{aps:{sound:'default'}}}});
+   const bad=[];
+   result.responses.forEach((r,idx)=>{if(!r.success){const code=r.error&&r.error.code||'';if(code.includes('registration-token-not-registered')||code.includes('invalid-registration-token'))bad.push(batch[idx].id);}});
+   if(bad.length) await p.query(`DELETE FROM customer_push_tokens WHERE id IN (${bad.map(()=>'?').join(',')})`,bad);
+  }
+ }catch(e){console.error('FCM send error:',e.message)}
+}
+function addNotification(d,to,title,message,meta={}){const n={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:String(to||'ALL'),title:String(title||'Rao Brothers'),message:String(message||''),date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),...meta};d.notifications=d.notifications||[];d.notifications.push(n);if(d.notifications.length>500)d.notifications=d.notifications.slice(-500);sendPush(n.to,n.title,n.message,n.meta).catch(()=>{});return n;}
 
 function runExpiryReminders(){
  try{
   const d=readDB(), now=new Date();
   const hour=now.getHours();
-  // Send one expiry reminder per day at 09:00. The customer gets 5,4,3,2,1-day reminders.
-  if(hour!==9) return;
+  if(hour!==9 && hour!==19) return;
   const today=new Date(now.getFullYear(),now.getMonth(),now.getDate());
   let changed=false;
   for(const c of d.customers||[]){
    if(!c.expiry || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiry)) continue;
-   if(Number(c.dueBalance||0)<=0) continue;
    const ex=new Date(c.expiry+'T00:00:00');
    const days=Math.round((ex-today)/86400000);
-   if(days<1 || days>5) continue;
+   if(days<0 || days>5) continue;
    const key=`EXPIRY:${c.id}:${c.expiry}:${days}:${hour}`;
    if((d.notifications||[]).some(n=>n.metaKey===key)) continue;
-   const msg=`🔔 Aapka ${c.plan||'Internet'} plan ${days} din baad (${c.expiry}) khatam hone wala hai. Payment ₹${Number(c.dueBalance||0).toFixed(2)} pending hai. Please recharge/payment karein.`;
-   const reminder={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:c.id,title:'📅 Plan Expiry Reminder',message:msg,metaKey:key,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};
-   d.notifications=d.notifications||[]; d.notifications.push(reminder);
-   // Also send as a real browser/Android push notification (notification bar).
-   sendPushForNotification(d,reminder).catch(e=>console.error('expiry push error:',e.message));
+   const msg=days===0
+    ? `⚠️ Aaj aapka plan expire ho raha hai. Due amount ₹${Number(c.dueBalance||0).toFixed(2)}. Please recharge karein.`
+    : `🔔 Aapka ${c.plan||'Internet'} plan ${days} din baad (${c.expiry}) khatam hone wala hai. Please recharge karein. Due amount ₹${Number(c.dueBalance||0).toFixed(2)}.`;
+   addNotification(d,c.id,'📅 Plan Expiry Reminder',msg,{metaKey:key});
    changed=true;
   }
   if(changed) persistDB(d);
@@ -161,12 +148,6 @@ setInterval(runExpiryReminders,60000);
 const server=http.createServer(async(req,res)=>{
 if(req.url.split('?')[0]==='/admin2'){try{const html=fs.readFileSync(path.join(__dirname,'public','admin2.html'),'utf8');return send(res,200,html,'text/html')}catch(e){return send(res,500,'Admin2 file missing','text/plain')}}if(req.method==='OPTIONS')return send(res,204,'');const u=new URL(req.url,'http://localhost');try{const d=readDB();
 if(u.pathname==='/api/health')return send(res,200,{ok:true,service:'Rao Brothers',time:new Date().toISOString()});
-if(u.pathname==='/api/push/vapid-public-key'&&req.method==='GET'){const cfg=pushConfig();if(!cfg)return send(res,503,{error:'Push notifications are not configured on server'});return send(res,200,{publicKey:cfg.pub})}
-if(u.pathname==='/api/push/subscribe'&&req.method==='POST'){const x=await body(req),role=String(x.role||'').toUpperCase(),id=String(x.id||'').trim().toUpperCase(),sub=x.subscription;if(!['CUSTOMER','WORKER','ADMIN'].includes(role)||!id||!sub||!sub.endpoint)return send(res,400,{error:'Valid role, id and push subscription required'});const key=role+':'+id;d.pushSubscriptions=d.pushSubscriptions||[];d.pushSubscriptions=d.pushSubscriptions.filter(a=>!(a.key===key&&a.subscription?.endpoint===sub.endpoint));d.pushSubscriptions.push({id:'PS'+Date.now()+Math.random().toString(36).slice(2,7),key,subscription:sub,updatedAt:new Date().toISOString()});persistDB(d);return send(res,200,{ok:true})}
-if(u.pathname==='/api/admin/login'&&req.method==='POST'){const x=await body(req);const username=String(x.username||'').trim();let adminUser=String(d.settings?.admin_username||'admin');let stored=d.settings?.admin_password_hash||'';if(!stored){stored=hashPassword('1234');d.settings=d.settings||{};d.settings.admin_username=adminUser;d.settings.admin_password_hash=stored;persistDB(d);}if(username!==adminUser||!verifyPassword(String(x.password||''),stored))return send(res,401,{error:'Invalid Admin ID or Password'});return send(res,200,{ok:true,token:newSession('admin',adminUser),username:adminUser});}
-if(u.pathname==='/api/admin/backup-status'&&req.method==='GET'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});try{const p=getPool(),[[x]]=await p.query('SELECT backup_date,created_at FROM rao_daily_backups ORDER BY backup_date DESC LIMIT 1');return send(res,200,{ok:true,lastBackup:x?.backup_date||null,createdAt:x?.created_at||null,retentionDays:30})}catch(e){return send(res,500,{error:e.message})}} if(u.pathname==='/api/admin/backup-now'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});try{lastBackupDate='';await saveDailyBackup(d);return send(res,200,{ok:true,message:'Backup saved successfully'})}catch(e){return send(res,500,{error:e.message})}} if(u.pathname==='/api/admin/change-password'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});const x=await body(req),old=String(x.currentPassword||''),nw=String(x.newPassword||'');const stored=d.settings?.admin_password_hash||'';if(!verifyPassword(old,stored))return send(res,401,{error:'Current admin password is incorrect'});if(nw.length<4)return send(res,400,{error:'New password must be at least 4 characters'});d.settings.admin_password_hash=hashPassword(nw);persistDB(d);return send(res,200,{ok:true,message:'Admin password changed successfully'});}
-if(u.pathname==='/api/worker/login'&&req.method==='POST'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),w=d.workers.find(a=>a.id===id);if(!w||w.active===false)return send(res,401,{error:'Invalid Worker ID or Password'});if(!verifyPassword(String(x.password||''),String(w.password||'')))return send(res,401,{error:'Invalid Worker ID or Password'});return send(res,200,{ok:true,token:newSession('worker',w.id),workerId:w.id,name:w.name});}
-if(u.pathname==='/api/worker/password'&&req.method==='POST'){if(!session(req,'admin'))return send(res,401,{error:'Admin login required'});const x=await body(req),id=String(x.workerId||'').trim().toUpperCase(),nw=String(x.newPassword||'');const w=d.workers.find(a=>a.id===id);if(!w)return send(res,404,{error:'Worker not found'});if(nw.length<4)return send(res,400,{error:'Password must be at least 4 characters'});w.password=hashPassword(nw);persistDB(d);return send(res,200,{ok:true,workerId:id,message:'Worker password updated'});}
 if(u.pathname==='/api/settings'&&req.method==='GET')return send(res,200,d.settings);
 if(u.pathname==='/api/settings'&&req.method==='POST'){const x=await body(req);d.settings=Object.assign({},d.settings||{}, {upi:String(x.upi||'').trim()});persistDB(d);return send(res,200,d.settings); }
 if(u.pathname==='/api/customers'&&req.method==='GET'){const cid=String(u.searchParams.get('customerId')||'').trim().toUpperCase();const list=cid?d.customers.filter(c=>c.id===cid):d.customers;return send(res,200,list.map(({password,...x})=>x));}
@@ -175,11 +156,6 @@ if(u.pathname==='/api/pons'&&req.method==='GET')return send(res,200,d.pons);
 if(u.pathname==='/api/pon'&&req.method==='POST'){const x=await body(req),oltId=String(x.oltId||'').trim().toUpperCase(),name=String(x.name||'').trim();if(!d.olts.some(o=>o.id===oltId))return send(res,400,{error:'Valid OLT required'});if(!name)return send(res,400,{error:'PON name required'});let n=d.pons.reduce((m,o)=>Math.max(m,Number(String(o.id).replace(/\D/g,''))||0),0)+1;const pon={id:'PON'+String(n).padStart(3,'0'),oltId,name};d.pons.push(pon);persistDB(d);return send(res,200,pon)}
 if(u.pathname==='/api/pon'&&req.method==='PUT'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),oltId=String(x.oltId||'').trim().toUpperCase(),name=String(x.name||'').trim(),p=d.pons.find(a=>a.id===id);if(!p)return send(res,404,{error:'PON not found'});if(!d.olts.some(o=>o.id===oltId))return send(res,400,{error:'Valid OLT required'});if(!name)return send(res,400,{error:'PON name required'});p.oltId=oltId;p.name=name;d.customers.filter(c=>c.ponId===id).forEach(c=>c.oltId=oltId);persistDB(d);return send(res,200,p)}
 if(u.pathname==='/api/pon'&&req.method==='DELETE'){const id=String(u.searchParams.get('ponId')||'').trim().toUpperCase();if(!id)return send(res,400,{error:'PON ID required'});if(d.customers.some(c=>c.ponId===id))return send(res,400,{error:'PON has customers. Move customers first.'});d.pons=d.pons.filter(p=>p.id!==id);persistDB(d);return send(res,200,{ok:true})}
-
-if(u.pathname==='/api/wireless-devices'&&req.method==='GET')return send(res,200,d.wirelessDevices||[]);
-if(u.pathname==='/api/wireless-device'&&req.method==='POST'){const x=await body(req),name=String(x.name||'').trim();if(!name)return send(res,400,{error:'Wireless device name required'});let n=(d.wirelessDevices||[]).reduce((m,o)=>Math.max(m,Number(String(o.id).replace(/\D/g,''))||0),0)+1;const w={id:'WLS'+String(n).padStart(3,'0'),name,brand:String(x.brand||'').trim(),model:String(x.model||'').trim(),ip:String(x.ip||'').trim(),location:String(x.location||'').trim(),type:String(x.type||'').trim(),notes:String(x.notes||'').trim(),active:true};d.wirelessDevices.push(w);persistDB(d);return send(res,200,w)}
-if(u.pathname==='/api/wireless-device'&&req.method==='PUT'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),w=(d.wirelessDevices||[]).find(a=>a.id===id);if(!w)return send(res,404,{error:'Wireless device not found'});for(const k of ['name','brand','model','ip','location','type','notes'])if(x[k]!==undefined)w[k]=String(x[k]||'').trim();if(x.active!==undefined)w.active=!!x.active;persistDB(d);return send(res,200,w)}
-if(u.pathname==='/api/wireless-device'&&req.method==='DELETE'){const id=String(u.searchParams.get('deviceId')||'').trim().toUpperCase();if(!id)return send(res,400,{error:'Wireless device ID required'});if(d.customers.some(c=>c.wirelessDeviceId===id))return send(res,400,{error:'Wireless device has customers. Move customers first.'});d.wirelessDevices=(d.wirelessDevices||[]).filter(w=>w.id!==id);persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/olt'&&req.method==='POST'){const x=await body(req),name=String(x.name||'').trim(),location=String(x.location||'').trim();if(!name)return send(res,400,{error:'OLT name required'});let n=d.olts.reduce((m,o)=>Math.max(m,Number(String(o.id).replace(/\D/g,''))||0),0)+1;const o={id:'OLT'+String(n).padStart(3,'0'),name,location};d.olts.push(o);persistDB(d);return send(res,200,o)}
 if(u.pathname==='/api/olt'&&req.method==='DELETE'){const id=String(u.searchParams.get('oltId')||'').toUpperCase();if(!id)return send(res,400,{error:'OLT ID required'});if(d.customers.some(c=>c.oltId===id))return send(res,400,{error:'OLT has customers. Reassign customers first.'});d.olts=d.olts.filter(o=>o.id!==id);persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/customer/password'&&req.method==='GET'){const id=String(u.searchParams.get('customerId')||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(!c)return send(res,404,{error:'Customer not found'});return send(res,200,{customerId:c.id,password:String(c.password||''),passwordChangeCount:Number(c.passwordChangeCount||0),passwordChangeAllowed:!!c.passwordChangeAllowed})}
@@ -202,22 +178,24 @@ if(u.pathname==='/api/customer/existing'&&req.method==='POST'){
  const dueAmount=Math.max(0,Number(x.dueAmount||0));
  const n=d.customers.length?Math.max(...d.customers.map(c=>Number(String(c.id).replace(/\D/g,''))||1000))+1:1001;
  const id=cleanId||'RB'+n; const oid=String(x.oltId||d.olts[0]?.id||'OLT001').toUpperCase(); if(!d.olts.some(o=>o.id===oid))return send(res,400,{error:'OLT not found'});
- const pid=String(x.ponId||d.pons.find(p=>p.oltId===oid)?.id||d.pons[0]?.id||'PON001').toUpperCase(); if(d.pons.length&&!d.pons.some(p=>p.id===pid))return send(res,400,{error:'PON not found'}); const wid=String(x.wirelessDeviceId||'').trim().toUpperCase(); if(wid&&!d.wirelessDevices.some(w=>w.id===wid))return send(res,400,{error:'Wireless device not found'});
- const c={id,name:String(x.name).trim(),mobile:String(x.mobile).trim(),address:String(x.address||'').trim(),pppoe:String(x.pppoe).trim(),oltId:oid,ponId:pid,wirelessDeviceId:wid||null,plan:plan.name,price,startDate:start,expiry,totalMonths,usedMonths,dueMonths,dueBalance:Number(dueAmount.toFixed(2)),dueItems:[],status:String(x.status||'Active'),password:String(x.password||'1234'),passwordChangeCount:0,passwordChangeAllowed:false,credit:0,existingCustomer:true,importedAt:new Date().toISOString()};
+ const pid=String(x.ponId||d.pons.find(p=>p.oltId===oid)?.id||d.pons[0]?.id||'PON001').toUpperCase(); if(d.pons.length&&!d.pons.some(p=>p.id===pid))return send(res,400,{error:'PON not found'});
+ const c={id,name:String(x.name).trim(),mobile:String(x.mobile).trim(),address:String(x.address||'').trim(),pppoe:String(x.pppoe).trim(),oltId:oid,ponId:pid,plan:plan.name,price,startDate:start,expiry,totalMonths,usedMonths,dueMonths,dueBalance:Number(dueAmount.toFixed(2)),dueItems:[],status:String(x.status||'Active'),password:String(x.password||'1234'),passwordChangeCount:0,passwordChangeAllowed:false,credit:0,existingCustomer:true,importedAt:new Date().toISOString()};
  if(c.dueBalance>0)c.dueItems.push({id:'LED'+Date.now(),type:'Existing Due',description:`Existing pending payment — ${dueMonths} month(s)`,amount:c.dueBalance,months:dueMonths,date:new Date().toISOString(),status:'Pending'});
  d.customers.push(c); if(c.dueBalance>0)addNotification(d,c.id,'🧾 Existing Customer Payment Due',`Pending payment ₹${c.dueBalance} for ${dueMonths} month(s). Your service is valid until ${c.expiry}.`); persistDB(d); const {password,...safe}=c; return send(res,200,safe);
 }
-if(u.pathname==='/api/customer'&&req.method==='POST'){const x=await body(req);if(!String(x.name||'').trim()||!String(x.mobile||'').trim())return send(res,400,{error:'Name and mobile required'});let n=d.customers.length?Math.max(...d.customers.map(c=>Number(String(c.id).replace(/\D/g,''))||1000))+1:1001;const now=new Date(),plan=d.plans.find(p=>p.name===x.plan)||d.plans[0],months=Math.max(1,Math.min(60,parseInt(x.months||1)||1)),startRaw=String(x.startDate||'').trim(),start=startRaw&&/^\d{4}-\d{2}-\d{2}$/.test(startRaw)?new Date(startRaw+'T00:00:00'):now;const c={id:'RB'+n,name:String(x.name).trim(),mobile:String(x.mobile).trim(),address:String(x.address||'').trim(),pppoe:String(x.pppoe||'').trim(),oltId:String(x.oltId||d.olts[0]?.id||'OLT001').toUpperCase(),ponId:String(x.ponId||d.pons.find(p=>p.oltId===String(x.oltId||d.olts[0]?.id||'OLT001').toUpperCase())?.id||d.pons[0]?.id||'PON001').toUpperCase(),wirelessDeviceId:String(x.wirelessDeviceId||'').toUpperCase()||null,plan:plan.name,price:Number(plan.price),months,startDate:iso(start),expiry:(/^\d{4}-\d{2}-\d{2}$/.test(String(x.expiry||''))?String(x.expiry):iso(addMonths(start,months))),status:'Active',password:String(x.password||'1234'),passwordChangeCount:0,passwordChangeAllowed:false,credit:0};d.customers.push(c);persistDB(d);const {password,...safe}=c;return send(res,200,safe)}
+if(u.pathname==='/api/customer'&&req.method==='POST'){const x=await body(req);if(!String(x.name||'').trim()||!String(x.mobile||'').trim())return send(res,400,{error:'Name and mobile required'});let n=d.customers.length?Math.max(...d.customers.map(c=>Number(String(c.id).replace(/\D/g,''))||1000))+1:1001;const now=new Date(),plan=d.plans.find(p=>p.name===x.plan)||d.plans[0],months=Math.max(1,Math.min(60,parseInt(x.months||1)||1)),startRaw=String(x.startDate||'').trim(),start=startRaw&&/^\d{4}-\d{2}-\d{2}$/.test(startRaw)?new Date(startRaw+'T00:00:00'):now;const c={id:'RB'+n,name:String(x.name).trim(),mobile:String(x.mobile).trim(),address:String(x.address||'').trim(),pppoe:String(x.pppoe||'').trim(),oltId:String(x.oltId||d.olts[0]?.id||'OLT001').toUpperCase(),ponId:String(x.ponId||d.pons.find(p=>p.oltId===String(x.oltId||d.olts[0]?.id||'OLT001').toUpperCase())?.id||d.pons[0]?.id||'PON001').toUpperCase(),plan:plan.name,price:Number(plan.price),months,startDate:iso(start),expiry:(/^\d{4}-\d{2}-\d{2}$/.test(String(x.expiry||''))?String(x.expiry):iso(addMonths(start,months))),status:'Active',password:String(x.password||'1234'),passwordChangeCount:0,passwordChangeAllowed:false,credit:0};d.customers.push(c);persistDB(d);const {password,...safe}=c;return send(res,200,safe)}
 if(u.pathname==='/api/customer/block'&&req.method==='POST'){const x=await body(req),id=String(x.customerId||x.id||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(!c)return send(res,404,{error:'Customer not found'});c.blocked=!!x.blocked;c.status=c.blocked?'Blocked':(c.status==='Blocked'?'Active':c.status);addNotification(d,c.id,c.blocked?'🚫 Account Blocked':'✅ Account Unblocked',c.blocked?'Your customer app account has been blocked by Admin. Please contact Rao Brothers.':'Your customer app account has been unblocked by Admin.');persistDB(d);return send(res,200,{ok:true,customerId:id,blocked:c.blocked,status:c.status})}
 if(u.pathname==='/api/customer'&&req.method==='DELETE'){const id=String(u.searchParams.get('customerId')||'').trim().toUpperCase();const idx=d.customers.findIndex(c=>c.id===id);if(idx<0)return send(res,404,{error:'Customer not found'});if(d.complaints.some(c=>c.customerId===id&&c.status!=='Resolved'))return send(res,400,{error:'Customer has active complaints. Resolve them first.'});d.customers.splice(idx,1);delete d.offers[id];d.notifications=d.notifications.filter(n=>n.to!==id);persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/customer/activate'&&req.method==='POST'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(!c)return send(res,404,{error:'Customer not found'});const months=Math.max(1,Math.min(60,parseInt(x.months||1)||1)),start=String(x.startDate||iso(new Date())).trim();if(!/^\d{4}-\d{2}-\d{2}$/.test(start))return send(res,400,{error:'Invalid start date'});const base=new Date(start+'T00:00:00');if(Number.isNaN(base.getTime()))return send(res,400,{error:'Invalid start date'});c.startDate=start;c.expiry=iso(addMonths(base,months));c.status='Active';c.activatedAt=new Date().toISOString();addNotification(d,c.id,'✅ Connection Activated',`Your connection has been activated from ${start} until ${c.expiry}.`);persistDB(d);const {password,...safe}=c;return send(res,200,safe)}
-if(u.pathname==='/api/customer'&&req.method==='PUT'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(!c)return send(res,404,{error:'Customer not found'});if(x.oltId){const oid=String(x.oltId).toUpperCase();if(!d.olts.some(o=>o.id===oid))return send(res,400,{error:'OLT not found'});c.oltId=oid}if(x.ponId){const pid=String(x.ponId).toUpperCase(),p=d.pons.find(a=>a.id===pid);if(!p)return send(res,400,{error:'PON not found'});c.ponId=pid;c.oltId=p.oltId}if(x.wirelessDeviceId!==undefined){const wid=String(x.wirelessDeviceId||'').toUpperCase();if(wid&&!d.wirelessDevices.some(w=>w.id===wid))return send(res,400,{error:'Wireless device not found'});c.wirelessDeviceId=wid||null}if(x.price!==undefined){const price=Number(x.price);if(!Number.isFinite(price)||price<0)return send(res,400,{error:'Valid bill amount required'});c.price=price}if(x.startDate!==undefined){const sd=String(x.startDate||'').trim();if(sd&&!/^\d{4}-\d{2}-\d{2}$/.test(sd))return send(res,400,{error:'Invalid start date'});c.startDate=sd}if(x.expiry!==undefined){const ed=String(x.expiry||'').trim();if(ed&&!/^\d{4}-\d{2}-\d{2}$/.test(ed))return send(res,400,{error:'Invalid expiry date'});c.expiry=ed}if(x.status!==undefined)c.status=String(x.status);const {password,...safe}=c;persistDB(d);return send(res,200,safe)}
+if(u.pathname==='/api/customer'&&req.method==='PUT'){const x=await body(req),id=String(x.id||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(!c)return send(res,404,{error:'Customer not found'});if(x.oltId){const oid=String(x.oltId).toUpperCase();if(!d.olts.some(o=>o.id===oid))return send(res,400,{error:'OLT not found'});c.oltId=oid}if(x.ponId){const pid=String(x.ponId).toUpperCase(),p=d.pons.find(a=>a.id===pid);if(!p)return send(res,400,{error:'PON not found'});c.ponId=pid;c.oltId=p.oltId}if(x.price!==undefined){const price=Number(x.price);if(!Number.isFinite(price)||price<0)return send(res,400,{error:'Valid bill amount required'});c.price=price}if(x.startDate!==undefined){const sd=String(x.startDate||'').trim();if(sd&&!/^\d{4}-\d{2}-\d{2}$/.test(sd))return send(res,400,{error:'Invalid start date'});c.startDate=sd}if(x.expiry!==undefined){const ed=String(x.expiry||'').trim();if(ed&&!/^\d{4}-\d{2}-\d{2}$/.test(ed))return send(res,400,{error:'Invalid expiry date'});c.expiry=ed}if(x.status!==undefined)c.status=String(x.status);const {password,...safe}=c;persistDB(d);return send(res,200,safe)}
 if(u.pathname==='/api/offer'&&req.method==='GET'){const id=(u.searchParams.get('customerId')||'').trim().toUpperCase();return send(res,200,d.offers[id]&&d.offers[id].active!==false?d.offers[id]:null)}
 if(u.pathname==='/api/offer'&&req.method==='POST'){const x=await body(req),id=String(x.customerId||'').trim().toUpperCase();if(!idOK(id))return send(res,400,{error:'Invalid customer ID'});const paid=Math.max(1,Math.min(24,parseInt(x.paidMonths||5)||5)),free=Math.max(0,Math.min(24,parseInt(x.freeMonths||1)||0)),now=new Date(),title=String(x.title||`PAY ${paid} MONTHS — GET ${free} MONTH FREE`).trim(),message=String(x.message||`Pay for ${paid} months and get ${free} month${free===1?'':'s'} free.`).trim();d.offers[id]={customerId:id,title,message,active:true,activatedAt:now.toISOString(),paidMonths:paid,freeMonths:free,paidUntil:iso(addMonths(now,paid)),serviceUntil:iso(addMonths(now,paid+free)),updatedAt:now.toISOString()};persistDB(d);return send(res,200,d.offers[id])}
 if(u.pathname==='/api/offer'&&req.method==='DELETE'){const id=(u.searchParams.get('customerId')||'').trim().toUpperCase();if(d.offers[id])delete d.offers[id];persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/offers'&&req.method==='GET')return send(res,200,Object.values(d.offers).filter(x=>x.active!==false));
-if(u.pathname==='/api/notifications'&&req.method==='GET'){const id=(u.searchParams.get('customerId')||'').trim().toUpperCase(),workerId=(u.searchParams.get('workerId')||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(u.searchParams.get('admin')==='1')return send(res,200,d.notifications.slice(-50).reverse());if(workerId)return send(res,200,d.notifications.filter(n=>n.to==='ALL'||n.to===workerId).slice(-30).reverse());return send(res,200,d.notifications.filter(n=>n.to==='ALL'||n.to===id||(c&&n.to==='OLT:'+c.oltId)||(c&&n.to==='PON:'+c.ponId)).slice(-30).reverse())}
-if(u.pathname==='/api/notification'&&req.method==='POST'){const x=await body(req),n={id:'NT'+Date.now(),to:String(x.to||'ALL').toUpperCase(),title:String(x.title||'Rao Brothers Message'),message:String(x.message||''),date:new Date().toLocaleString('en-IN'),time:Date.now()};if(!n.message)return send(res,400,{error:'Message required'});d.notifications.push(n);persistDB(d);sendPushForNotification(d,n).catch(e=>console.error('push notification error:',e.message));persistDB(d);return send(res,200,n)}
+if(u.pathname==='/api/push/register'&&req.method==='POST'){const x=await body(req);try{const r=await registerPushToken(x.customerId,x.token,x.platform||'android');return send(res,200,r)}catch(e){return send(res,400,{error:e.message})}}
+if(u.pathname==='/api/push/unregister'&&req.method==='POST'){const x=await body(req);const t=String(x.token||'').trim();if(!t)return send(res,400,{error:'Token required'});await getPool().query('DELETE FROM customer_push_tokens WHERE token=?',[t]);return send(res,200,{ok:true})}
+if(u.pathname==='/api/notifications'&&req.method==='GET'){const id=(u.searchParams.get('customerId')||'').trim().toUpperCase(),c=d.customers.find(a=>a.id===id);if(u.searchParams.get('admin')==='1')return send(res,200,d.notifications.slice(-50).reverse());return send(res,200,d.notifications.filter(n=>n.to==='ALL'||n.to===id||(c&&n.to==='OLT:'+c.oltId)||(c&&n.to==='PON:'+c.ponId)).slice(-30).reverse())}
+if(u.pathname==='/api/notification'&&req.method==='POST'){const x=await body(req);if(!String(x.message||'').trim())return send(res,400,{error:'Message required'});const n=addNotification(d,String(x.to||'ALL').toUpperCase(),String(x.title||'Rao Brothers Message'),String(x.message||''),x.meta&&typeof x.meta==='object'?x.meta:{});persistDB(d);return send(res,200,n)}
 if(u.pathname==='/api/notification'&&req.method==='DELETE'){const id=String(u.searchParams.get('id')||'').trim();const before=d.notifications.length;d.notifications=d.notifications.filter(n=>n.id!==id);if(d.notifications.length===before)return send(res,404,{error:'Notification not found'});persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/referral/new'&&req.method==='POST'){const x=await body(req),ref=String(x.referrerId||'').trim().toUpperCase();if(!idOK(ref)||!d.customers.some(c=>c.id===ref))return send(res,400,{error:'Valid referrer customer ID required'});if(!String(x.name||'').trim()||!String(x.mobile||'').trim())return send(res,400,{error:'New customer name and mobile required'});const r={id:'RF'+Date.now(),referrerId:ref,name:String(x.name).trim(),mobile:String(x.mobile).trim(),address:String(x.address||'').trim(),plan:String(x.plan||d.plans[0].name),status:'Pending',newCustomerDiscount:100,referrerCredit:100,createdAt:new Date().toISOString()};d.referrals.push(r);persistDB(d);return send(res,200,r)}
 if(u.pathname==='/api/referrals'&&req.method==='GET')return send(res,200,d.referrals.slice().reverse());
@@ -241,15 +219,7 @@ if(u.pathname==='/api/admin/service-credit'&&req.method==='POST'){
  c.startDate=c.startDate||iso(today);c.expiry=newExpiry;c.status='Active';c.months=months;
  const item={id:'LED'+Date.now(),type:mode,description:String(x.description||('Service recharge '+months+' month(s)')),amount:price,months,date:new Date().toISOString(),status:mode==='Cash'?'Paid':'Pending'};
  c.dueItems=c.dueItems||[];
- if(mode==='Udhaar'){
-   c.dueBalance=Number(c.dueBalance||0)+price;c.dueItems.push(item);
-   const n={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:c.id,title:'🧾 Payment Pending',message:`Aapka ${months} month recharge active kar diya gaya hai. Pending payment ₹${c.dueBalance}. Kripya payment jaldi karein.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),metaKey:'UDHAAR:'+item.id};
-   d.notifications.push(n);
-   sendPushForNotification(d,n).catch(e=>console.error('udhaar customer push error:',e.message));
-   const an={id:'NT'+Date.now()+Math.floor(Math.random()*1000),to:'ADMIN',title:'🧾 Payment Pending / Udhaar Recharge',message:`${c.name} (${c.id}) ka ${months} month recharge ₹${price} par activate hua hai, lekin payment pending hai. Total pending due ₹${c.dueBalance}. Note: ${item.description}`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString(),metaKey:'UDHAAR_ADMIN:'+item.id};
-   d.notifications.push(an);
-   sendPushForNotification(d,an).catch(e=>console.error('udhaar admin push error:',e.message));
- }
+ if(mode==='Udhaar'){c.dueBalance=Number(c.dueBalance||0)+price;c.dueItems.push(item);addNotification(d,c.id,'🧾 Recharge on Credit / Udhaar',`Your ${months} month recharge is active until ${c.expiry}. Pending payment: ₹${c.dueBalance}.`);}
  else {item.status='Paid';c.dueItems.push(item);addNotification(d,c.id,'💵 Cash Payment Recorded',`Cash payment of ₹${price} recorded. Your plan is active until ${c.expiry}.`);}
  persistDB(d);return send(res,200,{customer:c,item});
 }
@@ -285,8 +255,8 @@ if(u.pathname==='/api/payment'&&req.method==='POST'){
  const utr=String(x.utr||'').trim(),payerName=String(x.payerName||c.name||'').trim(),proof=String(x.proofImage||'').trim();
  if(!utr&&!proof)return send(res,400,{error:'Please provide UTR OR payment screenshot.'});
  if(proof && proof.length>4000000)return send(res,400,{error:'Payment screenshot is too large. Please use a smaller image.'});
- const p={id:'PAY'+Date.now(),customerId,customerName:c.name,amount,months,paidMonths:months,status:'Pending',date:new Date().toISOString(),utr,payerName,proofImage:proof||null,proofPath:proof||null};
- d.payments.push(p);const an={id:'NT'+Date.now(),to:'ADMIN',title:'💳 New Payment Received',message:`${c.name} (${customerId}) submitted ₹${amount}. ${utr?'UTR: '+utr+'. ':''}${proof?'Payment screenshot attached. ':''}Please verify payment.`,metaKey:'PAYMENT:'+p.id,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};d.notifications.push(an);persistDB(d);sendPushForNotification(d,an).catch(e=>console.error('payment push error:',e.message));return send(res,200,p)
+ const p={id:'PAY'+Date.now(),customerId,customerName:c.name,amount,months,status:'Pending',date:new Date().toISOString(),utr,payerName,proofImage:proof||null};
+ d.payments.push(p);addNotification(d,'ADMIN','💳 New Payment Received',`${c.name} (${customerId}) submitted ₹${amount}. ${utr?'UTR: '+utr+'. ':''}${proof?'Payment screenshot attached. ':''}Please verify payment.`,{paymentId:p.id});persistDB(d);return send(res,200,p)
 }
 if(u.pathname==='/api/payment'&&req.method==='DELETE'){const id=String(u.searchParams.get('id')||'').trim();const before=d.payments.length;d.payments=d.payments.filter(p=>p.id!==id);if(d.payments.length===before)return send(res,404,{error:'Payment not found'});persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/payments'&&req.method==='GET')return send(res,200,d.payments.slice().reverse());
@@ -295,39 +265,11 @@ if(u.pathname==='/api/payment/approve'&&req.method==='POST'){
  const x=await body(req),p=d.payments.find(a=>a.id===x.id);if(!p)return send(res,404,{error:'Payment not found'});
  if(p.status==='Approved')return send(res,200,p);
  p.status='Approved';p.approvedAt=new Date().toISOString();const c=d.customers.find(a=>a.id===p.customerId);
- if(c){
-  const start=new Date();
-  const payAmount=Number(p.amount||0);
-  const credit=Math.min(Number(c.credit||0),payAmount);
-  c.credit=Math.max(0,Number(c.credit||0)-credit);
-  let remainingPay=Math.max(0,payAmount-credit);
-  c.dueBalance=Math.max(0,Number(c.dueBalance||0));
-  c.dueItems=Array.isArray(c.dueItems)?c.dueItems:[];
-  // Apply an approved payment to the oldest pending dues first.
-  for(const item of c.dueItems){
-    if(remainingPay<=0) break;
-    if(String(item.status||'Pending')!=='Pending') continue;
-    const itemDue=Math.max(0,Number(item.amount||0));
-    if(!itemDue) { item.status='Paid'; continue; }
-    const applied=Math.min(itemDue,remainingPay);
-    item.amount=itemDue-applied;
-    item.paidAmount=Number(item.paidAmount||0)+applied;
-    if(item.amount<=0){item.amount=0;item.status='Paid';item.paidAt=new Date().toISOString();}
-    remainingPay-=applied;
-  }
-  c.dueBalance=Math.max(0,Number(c.dueBalance||0)-Math.max(0,payAmount-credit-remainingPay));
-  if(c.dueBalance<=0)c.dueBalance=0;
-  const months=Math.max(1,Number(p.months||p.paidMonths||1));
-  c.startDate=iso(start);
-  c.expiry=iso(addMonths(start,months));
-  c.status='Active';
-  const pn={id:'NT'+Date.now(),to:c.id,title:'✅ Payment Approved',message:`Your payment of ₹${p.amount} has been approved. Remaining pending payment: ₹${c.dueBalance}. Your plan is active until ${c.expiry}.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};
-  d.notifications.push(pn);sendPushForNotification(d,pn).catch(e=>console.error('payment approval push error:',e.message));
-}
+ if(c){const start=new Date(),credit=Math.min(Number(c.credit||0),Number(p.amount||0));c.credit=Math.max(0,Number(c.credit||0)-credit);c.startDate=iso(start);c.expiry=iso(addMonths(start,Math.max(1,p.months||1)));c.status='Active';addNotification(d,c.id,'✅ Payment Approved',`Your payment of ₹${p.amount} has been approved. Your plan is active until ${c.expiry}.`);}
  persistDB(d);return send(res,200,p)
 }
 if(u.pathname==='/api/workers'&&req.method==='GET')return send(res,200,d.workers);
-if(u.pathname==='/api/worker'&&req.method==='POST'){const x=await body(req),name=String(x.name||'').trim(),mobile=String(x.mobile||'').trim(),password=String(x.password||'1234');if(!name)return send(res,400,{error:'Technician name required'});if(password.length<4)return send(res,400,{error:'Password must be at least 4 characters'});let n=d.workers.reduce((m,w)=>Math.max(m,Number(String(w.id).replace(/\D/g,''))||0),0)+1;const w={id:'W'+String(n).padStart(3,'0'),name,mobile,status:'Available',lat:null,lng:null,lastLocation:null,password:hashPassword(password),active:true};d.workers.push(w);persistDB(d);return send(res,200,w)}
+if(u.pathname==='/api/worker'&&req.method==='POST'){const x=await body(req),name=String(x.name||'').trim(),mobile=String(x.mobile||'').trim();if(!name)return send(res,400,{error:'Technician name required'});let n=d.workers.reduce((m,w)=>Math.max(m,Number(String(w.id).replace(/\D/g,''))||0),0)+1;const w={id:'W'+String(n).padStart(3,'0'),name,mobile,status:'Available',lat:null,lng:null,lastLocation:null};d.workers.push(w);persistDB(d);return send(res,200,w)}
 if(u.pathname==='/api/worker'&&req.method==='DELETE'){const id=String(u.searchParams.get('workerId')||'').toUpperCase();if(!id)return send(res,400,{error:'Worker ID required'});const assigned=d.complaints.some(c=>c.workerId===id&&c.status!=='Resolved');if(assigned)return send(res,400,{error:'Technician has active complaints. Reassign them first.'});d.workers=d.workers.filter(w=>w.id!==id);persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/worker/status'&&req.method==='POST'){const x=await body(req),w=d.workers.find(a=>a.id===String(x.workerId||'').toUpperCase());if(!w)return send(res,404,{error:'Worker not found'});w.status=String(x.status)==='Busy'?'Busy':'Available';w.statusUpdatedAt=new Date().toISOString();persistDB(d);return send(res,200,w)}
 	if(u.pathname==='/api/worker/location'&&req.method==='POST'){const x=await body(req),w=d.workers.find(a=>a.id===String(x.workerId||'').toUpperCase());if(!w)return send(res,404,{error:'Worker not found'});w.lat=Number(x.lat);w.lng=Number(x.lng);w.lastLocation=new Date().toISOString();persistDB(d);return send(res,200,w)}
@@ -340,35 +282,11 @@ if(u.pathname==='/api/complaint'&&req.method==='DELETE'){
  return send(res,200,{ok:true});
 }
 if(u.pathname==='/api/complaint'&&req.method==='GET'){const id=(u.searchParams.get('customerId')||'').trim().toUpperCase();return send(res,200,id?d.complaints.filter(c=>c.customerId===id).slice().reverse():d.complaints.slice().reverse())}
-if(u.pathname==='/api/complaint'&&req.method==='POST'){
- const x=await body(req), now=new Date(), c={id:'CMP'+Date.now(),customerId:String(x.customerId||'').toUpperCase(),type:String(x.type||'Other'),message:String(x.message||''),status:'Open',priority:String(x.priority||'Normal')==='Urgent'?'Urgent':'Normal',workerId:null,workerName:null,customerLat:x.lat==null?null:Number(x.lat),customerLng:x.lng==null?null:Number(x.lng),createdAt:now.toISOString(),date:now.toLocaleString('en-IN'),technicianDone:false,customerConfirmed:false};
- d.complaints.push(c);
- const cu=d.customers.find(a=>a.id===c.customerId);
- addNotification(d,'ADMIN','🚨 New Complaint',`${c.customerId} ${cu?.name||''} submitted: ${c.type} — ${c.message}`);
- // Auto-assign the complaint to an available technician. Prefer the nearest technician when both locations are available.
- const available=d.workers.filter(w=>w.active!==false&&String(w.status||'Available')==='Available');
- let chosen=null;
- const hav=(la1,lo1,la2,lo2)=>{const R=6371,toRad=v=>v*Math.PI/180,dLa=toRad(la2-la1),dLo=toRad(lo2-lo1),a=Math.sin(dLa/2)**2+Math.cos(toRad(la1))*Math.cos(toRad(la2))*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(a));};
- if(available.length){
-   if(Number.isFinite(c.customerLat)&&Number.isFinite(c.customerLng)){
-     const withDist=available.filter(w=>Number.isFinite(Number(w.lat))&&Number.isFinite(Number(w.lng))).map(w=>({w,d:hav(c.customerLat,c.customerLng,Number(w.lat),Number(w.lng))})).sort((a,b)=>a.d-b.d);
-     if(withDist.length) chosen=withDist[0].w;
-   }
-   if(!chosen) chosen=available[0];
- }
- if(chosen){
-   c.workerId=chosen.id; c.workerName=chosen.name; c.status='Assigned'; c.assignedAt=now.toISOString(); chosen.status='Busy';
-   addNotification(d,c.customerId,'👨‍🔧 Technician Auto-Assigned',`${chosen.name} has been automatically assigned to your complaint.`);
-   addNotification(d,chosen.id,'🚨 New Complaint Assigned',`${cu?.name||c.customerId}: ${c.type} — ${c.message}`);
- } else {
-   addNotification(d,'ADMIN','⚠️ No Technician Available',`${c.id} is waiting for technician assignment because no technician is currently Available.`);
- }
- persistDB(d); return send(res,200,c)
-}
+if(u.pathname==='/api/complaint'&&req.method==='POST'){const x=await body(req),c={id:'CMP'+Date.now(),customerId:String(x.customerId||'').toUpperCase(),type:String(x.type||'Other'),message:String(x.message||''),status:'Open',priority:String(x.priority||'Normal')==='Urgent'?'Urgent':'Normal',workerId:null,workerName:null,customerLat:x.lat==null?null:Number(x.lat),customerLng:x.lng==null?null:Number(x.lng),createdAt:new Date().toISOString(),date:new Date().toLocaleString('en-IN'),technicianDone:false,customerConfirmed:false};d.complaints.push(c);const cu=d.customers.find(a=>a.id===c.customerId);addNotification(d,'ADMIN','🚨 New Complaint',`${c.customerId} ${cu?.name||''} submitted: ${c.type} — ${c.message}`);persistDB(d);return send(res,200,c)}
 if(u.pathname==='/api/complaints'&&req.method==='GET'){return send(res,200,d.complaints.slice().reverse().map(c=>{const cu=d.customers.find(x=>x.id===c.customerId);return Object.assign({},c,{customerName:cu?.name||c.customerId,customerAddress:cu?.address||''})}))}
 if(u.pathname==='/api/complaint/location'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});if(c.customerId!==String(x.customerId||'').toUpperCase())return send(res,403,{error:'Not your complaint'});c.customerLat=x.lat==null?null:Number(x.lat);c.customerLng=x.lng==null?null:Number(x.lng);c.locationUpdatedAt=new Date().toISOString();persistDB(d);return send(res,200,c)}
-if(u.pathname==='/api/complaint/assign'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id),w=d.workers.find(a=>a.id===String(x.workerId||'').toUpperCase());if(!c||!w)return send(res,404,{error:'Complaint or worker not found'});if(w.status==='Busy'&&c.workerId!==w.id)return send(res,400,{error:'Technician is Busy. Select an Available technician.'});c.workerId=w.id;c.workerName=w.name;c.status='Assigned';c.assignedAt=new Date().toISOString();w.status='Busy';const cn={id:'NT'+Date.now(),to:c.customerId,title:'👨‍🔧 Technician Assigned',message:`${w.name} has been assigned to your complaint. You will receive updates here.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};d.notifications.push(cn);const wn={id:'NT'+(Date.now()+1),to:w.id,title:'🛠️ New Complaint Assigned',message:`Complaint ${c.id} for ${c.customerId} has been assigned to you.`,date:new Date().toLocaleString('en-IN'),createdAt:new Date().toISOString()};d.notifications.push(wn);persistDB(d);sendPushForNotification(d,cn).catch(e=>{});sendPushForNotification(d,wn).catch(e=>{});persistDB(d);return send(res,200,c)}
-if(u.pathname==='/api/complaint/status'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});if(x.workerId&&c.workerId!==String(x.workerId).toUpperCase())return send(res,403,{error:'Not assigned to this worker'});const next=String(x.status||c.status);c.status=next;if(next==='On the Way'){c.onTheWayAt=new Date().toISOString();addNotification(d,c.customerId,'🚗 Technician On The Way',`${c.workerName||'Technician'} is on the way to you. Check the complaint screen for live distance/ETA when location is available.`)}if(next==='Working'){c.workStartedAt=new Date().toISOString();addNotification(d,c.customerId,'🔧 Technician Reached',`${c.workerName||'Technician'} has started working on your complaint.`)}if(next==='Technician Completed'){c.technicianDone=true;c.technicianDoneAt=new Date().toISOString();c.status=c.customerConfirmed?'Resolved':'Customer Confirmation Pending';addNotification(d,c.customerId,'✅ Work Completed',`${c.workerName||'Technician'} marked the work completed. Please open Support and confirm PROBLEM SOLVED.`)}if(c.status==='Resolved'){const w=d.workers.find(a=>a.id===c.workerId);if(w)w.status='Available';addNotification(d,c.customerId,'🟢 Complaint Resolved','Your complaint has been confirmed as resolved.');}const latest=d.notifications.slice(-3);latest.forEach(n=>sendPushForNotification(d,n).catch(()=>{}));persistDB(d);return send(res,200,c)}
+if(u.pathname==='/api/complaint/assign'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id),w=d.workers.find(a=>a.id===String(x.workerId||'').toUpperCase());if(!c||!w)return send(res,404,{error:'Complaint or worker not found'});if(w.status==='Busy'&&c.workerId!==w.id)return send(res,400,{error:'Technician is Busy. Select an Available technician.'});c.workerId=w.id;c.workerName=w.name;c.status='Assigned';c.assignedAt=new Date().toISOString();w.status='Busy';addNotification(d,c.customerId,'👨‍🔧 Technician Assigned',`${w.name} has been assigned to your complaint. You will receive updates here.`);persistDB(d);return send(res,200,c)}
+if(u.pathname==='/api/complaint/status'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});if(x.workerId&&c.workerId!==String(x.workerId).toUpperCase())return send(res,403,{error:'Not assigned to this worker'});const next=String(x.status||c.status);c.status=next;if(next==='On the Way'){c.onTheWayAt=new Date().toISOString();addNotification(d,c.customerId,'🚗 Technician On The Way',`${c.workerName||'Technician'} is on the way to you. Check the complaint screen for live distance/ETA when location is available.`)}if(next==='Working'){c.workStartedAt=new Date().toISOString();addNotification(d,c.customerId,'🔧 Technician Reached',`${c.workerName||'Technician'} has started working on your complaint.`)}if(next==='Technician Completed'){c.technicianDone=true;c.technicianDoneAt=new Date().toISOString();c.status=c.customerConfirmed?'Resolved':'Customer Confirmation Pending';addNotification(d,c.customerId,'✅ Work Completed',`${c.workerName||'Technician'} marked the work completed. Please open Support and confirm PROBLEM SOLVED.`)}if(c.status==='Resolved'){const w=d.workers.find(a=>a.id===c.workerId);if(w)w.status='Available';addNotification(d,c.customerId,'🟢 Complaint Resolved','Your complaint has been confirmed as resolved.');}persistDB(d);return send(res,200,c)}
 if(u.pathname==='/api/complaint/customer-confirm'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});if(c.customerId!==String(x.customerId||'').toUpperCase())return send(res,403,{error:'Not your complaint'});c.customerConfirmed=true;c.customerConfirmedAt=new Date().toISOString();c.status=c.technicianDone?'Resolved':'Technician Confirmation Pending';if(c.status==='Resolved'){const w=d.workers.find(a=>a.id===c.workerId);if(w)w.status='Available';addNotification(d,c.customerId,'🟢 Complaint Resolved','Thank you. Both customer and technician have confirmed the complaint is resolved.')}else addNotification(d,c.customerId,'👍 Confirmation Received','Your confirmation was received. Waiting for technician confirmation.');persistDB(d);return send(res,200,c)}
 if(u.pathname==='/api/complaint/update'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});if(x.priority)c.priority=String(x.priority)==='Urgent'?'Urgent':'Normal';if(x.expectedVisitAt!==undefined)c.expectedVisitAt=String(x.expectedVisitAt||'').trim();if(x.note!==undefined)c.workNote=String(x.note||'').trim();if(x.materials!==undefined)c.materials=String(x.materials||'').trim();if(x.beforePhoto)c.beforePhoto=String(x.beforePhoto);if(x.afterPhoto)c.afterPhoto=String(x.afterPhoto);c.updatedAt=new Date().toISOString();persistDB(d);return send(res,200,c)}
 	if(u.pathname==='/api/complaint/resolve'&&req.method==='POST'){const x=await body(req),c=d.complaints.find(a=>a.id===x.id);if(!c)return send(res,404,{error:'Complaint not found'});c.technicianDone=true;c.customerConfirmed=true;c.status='Resolved';c.resolvedAt=new Date().toISOString();persistDB(d);return send(res,200,c)}
@@ -377,30 +295,6 @@ if(u.pathname==='/api/upgrade'&&req.method==='POST'){const x=await body(req),id=
 if(u.pathname==='/api/upgrades'&&req.method==='GET')return send(res,200,d.upgrades.filter(x=>x.status!=='Rejected').slice().reverse())
 if(u.pathname==='/api/upgrade/approve'&&req.method==='POST'){const x=await body(req),q=d.upgrades.find(a=>a.id===x.id);if(!q)return send(res,404,{error:'Upgrade request not found'});if(q.status!=='Pending')return send(res,400,{error:'Request already processed'});const c=d.customers.find(a=>a.id===q.customerId);const p=d.plans.find(a=>a.name===q.requestedPlan);if(!c||!p)return send(res,400,{error:'Customer or plan not found'});c.plan=p.name;c.price=Number(p.price);q.status='Approved';q.approvedAt=new Date().toISOString();persistDB(d);return send(res,200,q)}
 if(u.pathname==='/api/upgrade/reject'&&req.method==='POST'){const x=await body(req),q=d.upgrades.find(a=>a.id===x.id);if(!q)return send(res,404,{error:'Upgrade request not found'});if(q.status!=='Pending')return send(res,400,{error:'Request already processed'});q.status='Rejected';q.rejectedAt=new Date().toISOString();persistDB(d);return send(res,200,q)}
-if(u.pathname==='/api/inventory'&&req.method==='GET'){return send(res,200,{items:d.inventory||[],movements:d.inventoryMovements||[]})}
-if(u.pathname==='/api/inventory/item'&&req.method==='POST'){
- const x=await body(req), item=String(x.item||x.name||'').trim(), category=String(x.category||'Other').trim();
- const company=String(x.company||'').trim(), model=String(x.model||'').trim(), qty=Math.max(0,Number(x.total||x.quantity||0));
- if(!item||qty<=0)return send(res,400,{error:'Item name and quantity required'});
- const r={id:'STK'+Date.now(),category,company,model,item,total:qty,available:qty,installed:0,lowThreshold:Math.max(0,Number(x.lowThreshold||1)),unit:String(x.unit||'pcs'),notes:String(x.notes||''),createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
- d.inventory=d.inventory||[];d.inventory.push(r);persistDB(d);return send(res,200,r)
-}
-if(u.pathname==='/api/inventory/item'&&req.method==='PUT'){
- const x=await body(req),r=(d.inventory||[]).find(a=>a.id===String(x.id));if(!r)return send(res,404,{error:'Stock item not found'});
- if(x.item!==undefined)r.item=String(x.item).trim();if(x.category!==undefined)r.category=String(x.category);if(x.company!==undefined)r.company=String(x.company);if(x.model!==undefined)r.model=String(x.model);if(x.notes!==undefined)r.notes=String(x.notes);if(x.lowThreshold!==undefined)r.lowThreshold=Math.max(0,Number(x.lowThreshold||0));if(x.unit!==undefined)r.unit=String(x.unit);if(x.addQty!==undefined){const q=Number(x.addQty||0);if(q<0)return send(res,400,{error:'Add quantity cannot be negative'});r.total+=q;r.available+=q;}r.updatedAt=new Date().toISOString();persistDB(d);return send(res,200,r)
-}
-if(u.pathname==='/api/inventory/item'&&req.method==='DELETE'){
- const id=String(u.searchParams.get('id')||''),r=(d.inventory||[]).find(a=>a.id===id);if(!r)return send(res,404,{error:'Stock item not found'});if(Number(r.installed||0)>0)return send(res,400,{error:'Cannot delete item while installed stock exists. Return issued items first.'});d.inventory=d.inventory.filter(a=>a.id!==id);persistDB(d);return send(res,200,{ok:true})
-}
-if(u.pathname==='/api/inventory/issue'&&req.method==='POST'){
- const x=await body(req),r=(d.inventory||[]).find(a=>a.id===String(x.inventoryId)),customerId=String(x.customerId||'').trim().toUpperCase(),c=(d.customers||[]).find(a=>a.id===customerId),qty=Math.max(1,Number(x.quantity||1));
- if(!r)return send(res,404,{error:'Stock item not found'});if(!c)return send(res,404,{error:'Customer not found'});if(r.available<qty)return send(res,400,{error:`Only ${r.available} ${r.unit} available`});
- r.available-=qty;r.installed+=qty;r.updatedAt=new Date().toISOString();const mv={id:'MOV'+Date.now(),inventoryId:r.id,item:r.item,company:r.company,model:r.model,customerId,customerName:c.name,quantity:qty,type:'ISSUE',note:String(x.note||''),createdAt:new Date().toISOString()};d.inventoryMovements=d.inventoryMovements||[];d.inventoryMovements.unshift(mv);persistDB(d);return send(res,200,{item:r,movement:mv})
-}
-if(u.pathname==='/api/inventory/return'&&req.method==='POST'){
- const x=await body(req),r=(d.inventory||[]).find(a=>a.id===String(x.inventoryId)),qty=Math.max(1,Number(x.quantity||1));if(!r)return send(res,404,{error:'Stock item not found'});if(r.installed<qty)return send(res,400,{error:`Only ${r.installed} ${r.unit} currently installed`});
- r.installed-=qty;r.available+=qty;r.updatedAt=new Date().toISOString();const mv={id:'MOV'+Date.now(),inventoryId:r.id,item:r.item,company:r.company,model:r.model,customerId:String(x.customerId||''),customerName:String(x.customerName||''),quantity:qty,type:'RETURN',note:String(x.note||''),createdAt:new Date().toISOString()};d.inventoryMovements=d.inventoryMovements||[];d.inventoryMovements.unshift(mv);persistDB(d);return send(res,200,{item:r,movement:mv})
-}
 if(u.pathname==='/api/plans'&&req.method==='GET')return send(res,200,d.plans);
 if(u.pathname==='/api/plan'&&req.method==='DELETE'){const name=String(u.searchParams.get('name')||'').trim();if(!name)return send(res,400,{error:'Plan name required'});if(d.customers.some(c=>c.plan===name))return send(res,400,{error:'Plan is assigned to customers. Change their plans first.'});d.plans=d.plans.filter(p=>p.name!==name);persistDB(d);return send(res,200,{ok:true})}
 if(u.pathname==='/api/plan'&&req.method==='POST'){const x=await body(req);const p={name:String(x.name||'').trim(),price:Number(x.price||0)};if(!p.name||!p.price)return send(res,400,{error:'Plan name and price required'});d.plans.push(p);persistDB(d);return send(res,200,p)}
