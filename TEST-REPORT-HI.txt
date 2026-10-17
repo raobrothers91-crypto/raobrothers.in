@@ -1,0 +1,16 @@
+Rao Brothers ISP — Test Report
+
+PASS:
+- Daily backup write/read-back verification and startup backup ordering reviewed/updated
+- node --check server.js
+- node --check public/sw-all-apps.js
+- node --check scripts/mysql-integration-test.js
+- npm run check (security/persistence static smoke checks)
+- package.json JSON parse
+
+NOT RUN / BLOCKED:
+- npm run test:mysql: no DB_HOST, DB_NAME, DB_USER, DB_PASSWORD were supplied in this environment. Run it on the configured staging/GoDaddy environment after the server initializes the auth and backup tables.
+- Full application restore drill: intentionally not run against any live database. The integration script validates backup JSON and rollback semantics using a disposable test table only.
+- End-to-end browser tests for customer/admin/worker/payment/complaints: not run.
+
+Important: syntax/static tests do not prove production readiness. Use a staging database and take a verified backup first.
